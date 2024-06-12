@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "beatrice-trainer"
+version = "2.0.0a2"
+description = "A tool to train Beatrice models"
+authors = ["Project Beatrice <prj-beatrice@users.noreply.huggingface.co>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.9"
+torch = "^2"
+torchaudio = "^2"
+tqdm = "^4"
+numpy = "^1"
+tensorboard = "^2"
+soundfile = "^0.11"
+pyworld = "^0.3.2"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

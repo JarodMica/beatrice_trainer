@@ -1,0 +1,30 @@
+{
+    "learning_rate": 1e-4,
+    "min_learning_rate": 5e-6,
+    "adam_betas": [
+        0.8,
+        0.99
+    ],
+    "adam_eps": 1e-6,
+    "batch_size": 8,
+    "grad_weight_mel": 1.0,
+    "grad_weight_adv": 1.0,
+    "grad_weight_fm": 1.0,
+    "grad_balancer_ema_decay": 0.995,
+    "use_amp": true,
+    "num_workers": 8,
+    "n_steps": 3000000,
+    "warmup_steps": 10000,
+    "in_sample_rate": 16000,
+    "out_sample_rate": 24000,
+    "wav_length": 96000,
+    "segment_length": 100,
+    "phone_extractor_file": "assets/pretrained/003b_checkpoint_03000000.pt",
+    "pitch_estimator_file": "assets/pretrained/008_1_checkpoint_00300000.pt",
+    "in_ir_wav_dir": "assets/ir",
+    "in_noise_wav_dir": "assets/noise",
+    "in_test_wav_dir": "assets/test",
+    "pretrained_file": null,
+    "hidden_channels": 256,
+    "san": false
+}
