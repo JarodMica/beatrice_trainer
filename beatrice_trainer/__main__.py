@@ -14,6 +14,7 @@ from copy import deepcopy
 from fractions import Fraction
 from functools import partial
 from pathlib import Path
+from pprint import pprint
 from random import Random
 from typing import BinaryIO, Literal, Optional, Union
 
@@ -56,30 +57,25 @@ dict_default_hparams = {
     "adam_betas": [0.8, 0.99],
     "adam_eps": 1e-6,
     "batch_size": 8,
-    "grad_weight_mel": 3.0,  # grad_weight は比が同じなら同じ意味になるはず
+    "grad_weight_mel": 1.0,  # grad_weight は比が同じなら同じ意味になるはず
     "grad_weight_adv": 1.0,
     "grad_weight_fm": 1.0,
     "grad_balancer_ema_decay": 0.995,
     "use_amp": True,
-    "num_workers": min(os.cpu_count(), max(16, os.cpu_count() - 1)),
-    "n_steps": 3000000,
+    "num_workers": 16,
+    "n_steps": 100000,
     "warmup_steps": 10000,
     "in_sample_rate": 16000,  # 変更不可
     "out_sample_rate": 24000,  # 変更不可
     "wav_length": 4 * 24000,  # 4s
     "segment_length": 100,  # 1s
     # data
-    "phone_extractor_file": "notebooks/003b/checkpoint_03000000.pt",  # TODO
-    # "phone_extractor_file": "",
-    "pitch_estimator_file": "notebooks/034pre/008_1_checkpoint_00300000.pt",  # TODO
-    # "pitch_estimator_file": "",
-    "in_ir_wav_dir": "../cavorite-ball-hf/data/ir",  # TODO
-    # "in_ir_wav_dir": "data/ir",
-    "in_noise_wav_dir": "../DNS-Challenge/datasets_fullband/noise_fullband",  # TODO
-    # "in_noise_wav_dir": "data/noise",
-    "in_test_wav_dir": "../cavorite-ball-hf/data/test",  # TODO
-    # "in_test_wav_dir": "data/test",
-    "pretrained_file": None,
+    "phone_extractor_file": "assets/pretrained/003b_checkpoint_03000000.pt",
+    "pitch_estimator_file": "assets/pretrained/008_1_checkpoint_00300000.pt",
+    "in_ir_wav_dir": "assets/ir",
+    "in_noise_wav_dir": "assets/noise",
+    "in_test_wav_dir": "assets/test",
+    "pretrained_file": "assets/pretrained/040c_checkpoint_libritts_r_200_02300000.pt",  # None も可
     # model
     "hidden_channels": 256,  # ファインチューン時変更不可、変更した場合は推論側の対応必要
     "san": False,  # ファインチューン時変更不可
@@ -130,10 +126,10 @@ def prepare_training_configs() -> tuple[dict, Path, Path, bool]:
 
     parser = argparse.ArgumentParser()
     # fmt: off
-    parser.add_argument("-c", "--config", type=Path, help="Path to the config file.")
-    parser.add_argument("-d", "--data_dir", type=Path, help="Directory containing the training data.")
-    parser.add_argument("-o", "--out_dir", type=Path, help="Output directory.")
-    parser.add_argument("-r", "--resume", action="store_true", help="Resume training.")
+    parser.add_argument("-d", "--data_dir", type=Path, help="directory containing the training data")
+    parser.add_argument("-o", "--out_dir", type=Path, help="output directory")
+    parser.add_argument("-r", "--resume", action="store_true", help="resume training")
+    parser.add_argument("-c", "--config", type=Path, help="path to the config file")
     # fmt: on
     args = parser.parse_args()
 
@@ -512,7 +508,6 @@ class PhoneExtractor(nn.Module):
         backbone_embed_kernel_size: int = 7,
         kernel_size: int = 17,
         n_blocks: int = 8,
-        cardinality: int = 256,
     ):
         super().__init__()
         self.feature_extractor = FeatureExtractor(hidden_channels)
@@ -539,13 +534,6 @@ class PhoneExtractor(nn.Module):
             kernel_size=kernel_size,
         )
         self.head = weight_norm(nn.Conv1d(hidden_channels, phone_channels, 1))
-
-        self.label_embeddings = nn.ModuleList(
-            [
-                nn.Embedding(cardinality, phone_channels),
-                nn.Embedding(cardinality, phone_channels),
-            ]
-        )
 
     def forward(
         self, x: torch.Tensor, return_stats: bool = True
@@ -946,12 +934,14 @@ def generate_noise(aperiodicity: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
         batch_size, (length + 1) * hop_length, device=aperiodicity.device
     )
     excitation -= 0.5
+    n_fft = 2 * hop_length
     # 矩形窓で分析
     # Complex[batch_size, hop_length + 1, length]
     noise = torch.stft(
         excitation,
-        n_fft=2 * hop_length,
+        n_fft=n_fft,
         hop_length=hop_length,
+        window=torch.ones(n_fft, device=excitation.device),
         center=False,
         return_complex=True,
     )
@@ -1668,6 +1658,7 @@ class DiscriminatorR(nn.Module):
                 n_fft=n_fft,
                 hop_length=hop_length,
                 win_length=win_length,
+                window=torch.ones(win_length, device=x.device),
                 center=False,
                 return_complex=True,
             ).abs()
@@ -1923,8 +1914,10 @@ def compute_grad_norm(
     for name, p in model.named_parameters():
         if p.grad is None:
             continue
-        param_norm = p.grad.data.norm(2.0).item()
-        total_norm += param_norm**2
+        param_norm = p.grad.data.norm().item()
+        if not math.isfinite(param_norm):
+            param_norm = p.grad.data.float().norm().item()
+        total_norm += param_norm * param_norm
         if return_stats:
             stats[f"grad_norm_{name}"] = param_norm
     total_norm = math.sqrt(total_norm)
@@ -2252,7 +2245,7 @@ def prepare_training():
     )()
 
     print("config:")
-    print(h)
+    pprint(h)
     print()
     h = AttrDict(h)
 
@@ -2386,7 +2379,7 @@ def prepare_training():
     )
     training_loader = torch.utils.data.DataLoader(
         training_dataset,
-        num_workers=h.num_workers,
+        num_workers=min(h.num_workers, os.cpu_count()),
         collate_fn=training_dataset.collate,
         shuffle=True,
         sampler=None,
@@ -2395,27 +2388,23 @@ def prepare_training():
         drop_last=True,
     )
 
-    print("Computing mean F0s of target speakers...")
+    print("Computing mean F0s of target speakers...", end="")
     speaker_f0s = []
     for speaker, files in enumerate(speaker_audio_files):
         if len(files) > 10:
             files = Random(42).sample(files, 10)
         f0 = compute_mean_f0(files)
         speaker_f0s.append(f0)
-        print(f"  {speaker:3d}: {f0:.1f}Hz", end=",")
-        if speaker % 5 == 4:
+        if speaker % 5 == 0:
             print()
+        print(f"  {speaker:3d}: {f0:.1f}Hz", end=",")
+    print()
     print("Done.")
     print("Computing pitch shifts for test files...")
     test_pitch_shifts = []
-    # fmt: off
-    # TODO
-    source_f0s_cache = [275.9,230.0,135.8,129.6,256.4,357.4,463.7,315.3,144.8,119.5,232.4,349.4,444.0,330.7,182.5,272.4,314.9,282.6,171.5,250.0,208.7,317.9,325.3,168.0,320.0,308.3,113.3,196.8,244.7,292.9,381.3,297.6,218.5,286.4,350.8,372.1,276.7,309.9,157.3,160.0,147.3,128.3,332.4,301.4,123.5,308.9,206.5,312.5,186.5,327.7,335.8,116.1,505.2,452.8,135.4,293.3,239.9,368.0,293.0,288.4,184.1,441.3,272.3,278.9,154.2,297.1,360.3,545.7,270.3,412.0,294.5,351.6,336.6,120.1,308.4,236.4,340.5,158.2,170.8,460.8,407.4,302.8,165.9,304.8,154.1,250.9,257.1,206.0,222.6,346.8,378.7,131.8,166.6,109.0,239.6,206.5,214.1,192.5,132.9,487.1,270.4,142.6,117.2,364.6,321.8,130.3,491.6,263.8,346.6,349.0,290.5,264.4,117.1,136.8,146.6,336.0,228.0,242.0,134.3,301.5,414.9,212.4,108.6,321.7,313.4,168.6,222.4,399.4,325.3,175.5,116.8,411.9,303.3,380.6,230.7,127.4,167.6,151.5,332.7,149.3,126.0,356.2,247.9,246.2,396.3,245.9,175.4,290.5,208.1,505.1,480.1,245.1,241.8,269.6,280.3,407.6,140.6,263.5,255.8,195.6,272.2,167.8,383.1,254.7,101.8,245.7,114.1,124.2,349.1,180.3,205.4,242.6,407.6,303.3,272.0,248.3,106.5,263.8,266.3,147.1,201.6,412.0,192.4,122.0,184.8,381.5,243.3,153.9,174.1,323.9,254.5,209.3,241.1,402.6,264.8,333.6,293.1,194.1,124.7,407.6,161.7,134.2,383.3,268.7,286.6,326.4,302.9,183.4,362.3,86.7,198.0,238.9,229.0,244.4,258.4,196.5,170.3,299.5,235.1,219.4,260.6,231.9,269.9,112.2,168.4,239.7,195.7,228.4,190.7,336.6,357.6,185.3,349.7,293.1,229.2,287.0,354.0,245.4,306.5,185.8,369.7,118.6,98.5,269.4,264.4,320.1,159.5,281.3,300.2,99.2,399.2,316.0,279.7,334.7,109.4,162.1,113.0,237.9,107.1,122.3,246.8,303.3,118.2,122.8,139.2,258.1,250.0,188.7,252.8,120.2,272.4,114.2,251.9,198.7,364.1,588.4,269.5,164.6,192.5,313.7,280.3,235.2,264.5,185.2,500.4,324.9,275.0,160.7,173.3,237.3,393.4,286.0,313.2,166.1,278.7,200.4,292.8,260.6,297.0,113.1,228.5,118.4,359.7,127.6,128.3,332.2,367.7,548.5,290.3,273.7,176.5,250.0,219.7,218.9,471.2,355.9,283.9,230.9,290.5,200.0,268.4,260.4,339.9,416.2,171.2,443.1,273.0,118.4,371.9,228.1,295.3,482.2,391.1,173.0,131.1,112.6,286.9,95.0,349.7,218.4,143.8,344.0,153.4,364.6,329.7,213.3,499.0,162.6,227.5,526.2,151.8,242.6,273.6,107.1,339.8,350.8,324.8,173.9,247.5,401.9,253.9,294.9,281.4,342.1,495.2,141.4,371.3,265.3,403.5,137.3,270.8,143.2,291.4,199.9,274.0,121.3,326.5,143.8,371.3,255.7,392.6,302.8,152.1,332.2,225.1,257.5,470.4,220.3,226.2,101.2,301.4,137.4,274.5,218.1,270.4,238.5,192.6,461.5,219.3,368.8,248.7,316.6,242.5,335.8,274.6,241.5,386.5,232.6,510.6,203.1,291.0,229.6,346.0,262.9,397.0,136.8,189.6,304.7,177.7,351.1,220.2,113.2,301.1,311.6,106.2,105.7,342.1,125.0,252.6,371.2,274.1,152.2,461.0,131.1,211.6,325.3,421.7,291.0,402.4,254.7,304.3,118.5,122.1,436.8,186.6,217.5,356.3,207.1,147.6,390.9,293.7,409.4,151.5,182.5,433.9,302.2,278.0,145.0,345.4,322.4,85.9,237.0,342.1,329.2,546.4,287.2,246.3,249.5,293.2,318.1,271.7,122.7,183.6,135.4,327.0,254.4,367.8,256.8,233.4,268.9,290.4,242.8,178.2,174.8,536.3,171.9,262.6,285.9,306.2,212.1,295.0,180.3,371.8,264.8,318.6,278.4,267.3,437.1,466.0,272.6,168.4,312.9,299.5,424.7,177.9,294.1,274.7,318.9,395.0,548.1,116.7,322.8,188.5,315.3,321.1,280.3,254.2,249.6,274.5,333.2,285.6,370.4,278.7,218.2,106.1,122.3,351.7,254.7,465.2,100.6,176.0,187.6,181.3,277.3,156.0,437.3,322.7,293.5,361.4,237.4,272.0,218.1,236.3,292.1,245.8,335.5,197.7,150.7,210.1,278.5,386.0,198.7,246.8,177.0,337.1,342.3,264.6,412.4,189.0,138.1,274.8,246.6,469.5,183.1,277.8,296.0,376.6,96.3,236.8,102.9,292.1,121.9,238.2,431.0,130.3,195.3,532.3,447.0,265.7,216.3,104.3,124.7,138.6,193.9,322.3,327.1,124.2,398.0,124.7,200.5,130.0,410.0,323.2,251.0,283.8,127.7,156.6,261.3,114.3,316.5,192.8,134.6,230.1,175.8,200.4,156.7,103.4,293.8,475.1,295.1,112.7,608.3,294.5,518.7,114.5,106.1,556.2,108.6,266.8,275.5,406.8,377.2,206.3,127.9,293.7,239.3,323.0,338.4,128.5,501.1,94.3,143.2,261.0,433.6,166.8,281.7,116.2,255.7,172.8,174.7,104.4,164.4,343.8,269.2,177.2,130.2,186.2,471.5,161.1,257.6,270.7,99.4,274.2,209.8,161.3,181.8,241.0,134.6,154.0,366.2,316.4,211.1,478.1,131.8,288.8,114.4,545.1,303.8,327.2,321.7,98.2,285.0,122.9,150.0,176.6,187.2,322.2,221.6,189.8,174.7,142.8,410.0,349.0,487.4,132.2,147.8,121.3,282.5,288.1,464.8,365.6,289.4,209.9,256.8,129.7,247.0,262.8,266.1,312.2,297.9,221.5,116.0,402.5,157.1,123.8,120.6,113.2,304.2,232.9,468.6,130.3,194.5,266.7,112.6,381.8,389.5,413.6,427.5,126.5,242.2,259.3,161.0,365.0,155.9,460.0,433.9,288.2,360.5,252.0,119.6,373.3,126.1,130.5,284.1,539.1,265.9,245.9,346.3,283.3,162.2,113.4,134.3,181.5,178.7,275.4,111.8,247.4,201.1,311.3,278.1,268.9,401.1,107.0,306.8,167.8,259.2,169.2,127.6,173.3,270.2,153.0,264.3,316.8,341.2,321.4,271.1,297.1,424.9,284.9,123.7,147.8,226.0,267.2,202.1,199.4,219.5,209.4,343.8,108.8,119.4,273.5,176.0,122.4,130.4,322.2,113.4,261.5,281.3,293.4,127.3,281.4,490.3,358.4,296.0,370.4,307.7,196.5,119.9,206.8,282.4,128.8,234.5,239.5,182.8,321.4,285.7,101.9,212.0,254.4,352.1,261.6,145.4,107.6,304.7,111.1,317.6,124.2,290.9,295.9,406.4,369.2,283.2,96.9,188.3,170.5,150.3,463.3,345.0,166.2,261.6,277.9,334.8,341.2,207.2,215.4,332.2,326.7,233.1,322.8,174.2,452.0,327.5,328.6,162.1,188.4,356.0,151.6,318.5,119.5,247.7,191.9,217.4,233.0,130.8,283.1,242.9,259.4,359.0,230.6,302.9,261.1,257.8,308.1,271.7,373.6,333.4,150.8,292.0,343.1,277.5,318.0,142.1,174.5,119.3,382.6,306.9,136.5,215.3,122.4,336.4,311.7,133.5,294.1,158.3,201.7,152.8,246.6,151.3,248.0,231.1,457.5,309.6,325.9,192.9,177.8,113.9,295.8,315.6,134.6,108.5,317.3,121.7,141.0,235.3,417.0,201.9,176.0,229.5,140.8,156.2,312.2,139.3,241.5,360.5,321.1,351.8,341.1,233.3,379.7,129.5,241.7,291.5,434.2,296.1,232.0,237.4,314.7,279.4,304.6,279.9,358.8,289.5,491.9,132.1,469.1,103.9,172.9,516.0,103.8,591.9,351.3,116.9,360.0,431.4,147.4,131.5,218.1,110.6,218.6,231.5,423.5,318.5,167.7,284.0,276.8,149.3,295.1,244.8,290.6,233.8,293.5,131.5,231.5,127.4,328.2,199.7,102.5,257.5,459.1,267.0,149.8,226.9,194.7,297.2,337.5,283.9,130.7,171.9,249.4,278.9,123.6,111.6,293.0,193.0,400.1,412.4,410.8,321.3,380.7,213.4,157.9,307.0,126.0,126.9,188.3,362.5,246.5,295.3,140.2,241.1]
-    # fmt: on
     source_f0s = []
     for i, (file, target_ids) in enumerate(tqdm(test_filelist)):
-        # source_f0 = compute_mean_f0([file], method="harvest")
-        source_f0 = source_f0s_cache[i]
+        source_f0 = compute_mean_f0([file], method="harvest")
         source_f0s.append(source_f0)
         if source_f0 != source_f0:
             test_pitch_shifts.append([0] * len(target_ids))
@@ -2438,10 +2427,7 @@ def prepare_training():
         repo_root() / h.phone_extractor_file, map_location="cpu"
     )
     print(
-        phone_extractor.load_state_dict(
-            phone_extractor_checkpoint["phone_extractor"],
-            strict=False,
-        )
+        phone_extractor.load_state_dict(phone_extractor_checkpoint["phone_extractor"])
     )
     del phone_extractor_checkpoint
 
@@ -2499,14 +2485,15 @@ def prepare_training():
         checkpoint_file = None
     if checkpoint_file is not None:
         checkpoint = torch.load(checkpoint_file, map_location="cpu")
-        checkpoint_n_speakers = len(checkpoint["net_g"]["embed_speaker.weight"])
         if not resume:  # ファインチューニング
-            mean_speaker_embedding = checkpoint["net_g"]["embed_speaker.weight"].mean(
-                0, keepdim=True
-            )
+            checkpoint_n_speakers = len(checkpoint["net_g"]["embed_speaker.weight"])
+            initial_speaker_embedding = checkpoint["net_g"]["embed_speaker.weight"][:1]
+            # initial_speaker_embedding = checkpoint["net_g"]["embed_speaker.weight"].mean(
+            #     0, keepdim=True
+            # )
             if True:
                 # 0 とかランダムとかの方が良いかもしれない
-                checkpoint["net_g"]["embed_speaker.weight"] = mean_speaker_embedding[
+                checkpoint["net_g"]["embed_speaker.weight"] = initial_speaker_embedding[
                     [0] * n_speakers
                 ]
             else:  # 話者追加用
@@ -2520,15 +2507,15 @@ def prepare_training():
                 )
                 checkpoint["net_g"]["embed_speaker.weight"][
                     checkpoint_n_speakers:
-                ] = mean_speaker_embedding
+                ] = initial_speaker_embedding
         print(net_g.load_state_dict(checkpoint["net_g"], strict=False))
         print(net_d.load_state_dict(checkpoint["net_d"], strict=False))
         if resume:
             optim_g.load_state_dict(checkpoint["optim_g"])
             optim_d.load_state_dict(checkpoint["optim_d"])
-            grad_balancer.load_state_dict(checkpoint["gradient_balancer"])
             initial_iteration = checkpoint["iteration"]
-        grad_scaler.load_state_dict(checkpoint["scaler"])
+        grad_balancer.load_state_dict(checkpoint["grad_balancer"])
+        grad_scaler.load_state_dict(checkpoint["grad_scaler"])
 
     # スケジューラ
 
@@ -2712,11 +2699,11 @@ if __name__ == "__main__":
         dict_scalars["loss_g/loss_adv"].append(loss_adv.item())
         dict_scalars["other/grad_scale"].append(grad_scaler.get_scale())
         dict_scalars["loss_d/loss_discriminator"].append(loss_discriminator.item())
-        if grad_norm_d == grad_norm_d:
+        if math.isfinite(grad_norm_d):
             dict_scalars["other/gradient_norm_d"].append(grad_norm_d)
             for name, value in d_grad_norm_stats.items():
                 dict_scalars[f"~gradient_norm_d/{name}"].append(value)
-        if grad_norm_g == grad_norm_g:
+        if math.isfinite(grad_norm_g):
             dict_scalars["other/gradient_norm_g"].append(grad_norm_g)
             for name, value in g_grad_norm_stats.items():
                 dict_scalars[f"~gradient_norm_g/{name}"].append(value)
@@ -2851,8 +2838,8 @@ if __name__ == "__main__":
                     "net_d": net_d.state_dict(),
                     "optim_g": optim_g.state_dict(),
                     "optim_d": optim_d.state_dict(),
-                    "gradient_balancer": grad_balancer.state_dict(),
-                    "scaler": grad_scaler.state_dict(),
+                    "grad_balancer": grad_balancer.state_dict(),
+                    "grad_scaler": grad_scaler.state_dict(),
                     "h": dict(h),
                 },
                 checkpoint_file_save,
@@ -2892,6 +2879,7 @@ if __name__ == "__main__":
             with open(paraphernalia_dir / f"formant_shift_embeddings.bin", "wb") as f:
                 dump_layer(net_g_fp16.embed_formant_shift, f)
             del net_g_fp16
+            shutil.copy(repo_root() / "assets/images/noimage.png", paraphernalia_dir)
             with open(
                 paraphernalia_dir / f"beatrice_paraphernalia_{name}.toml",
                 "w",
@@ -2921,6 +2909,11 @@ No description for this voice.
 この声の説明はありません。
 """
 average_pitch = {average_pitch}
+
+[voice.{speaker_id}.portrait]
+path = "noimage.png"
+description = """
+"""
 '''
                     )
             del paraphernalia_dir

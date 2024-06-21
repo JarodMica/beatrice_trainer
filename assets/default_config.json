@@ -12,8 +12,8 @@
     "grad_weight_fm": 1.0,
     "grad_balancer_ema_decay": 0.995,
     "use_amp": true,
-    "num_workers": 8,
-    "n_steps": 3000000,
+    "num_workers": 16,
+    "n_steps": 100000,
     "warmup_steps": 10000,
     "in_sample_rate": 16000,
     "out_sample_rate": 24000,
@@ -24,7 +24,7 @@
     "in_ir_wav_dir": "assets/ir",
     "in_noise_wav_dir": "assets/noise",
     "in_test_wav_dir": "assets/test",
-    "pretrained_file": null,
+    "pretrained_file": "assets/pretrained/040c_checkpoint_libritts_r_200_02300000.pt",
     "hidden_channels": 256,
     "san": false
 }

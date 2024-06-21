@@ -33,12 +33,23 @@ cd beatrice-trainer
 Poetry などを使用して、依存ライブラリをインストールしてください。
 ```sh
 poetry install
+poetry shell
 ```
 
 正しくインストールできていれば、 `python3 beatrice_trainer -h` で以下のようなヘルプが表示されます。
 
 ```
-(TBW)
+usage: beatrice_trainer [-h] [-d DATA_DIR] [-o OUT_DIR] [-r] [-c CONFIG]
+
+options:
+  -h, --help            show this help message and exit
+  -d DATA_DIR, --data_dir DATA_DIR
+                        directory containing the training data
+  -o OUT_DIR, --out_dir OUT_DIR
+                        output directory
+  -r, --resume          resume training
+  -c CONFIG, --config CONFIG
+                        path to the config file
 ```
 
 ### 3. Prepare Your Training Data
@@ -85,7 +96,7 @@ your_training_data_dir_with_only_one_speaker
 python3 beatrice_trainer -d <your_training_data_dir> -o <output_dir>
 ```
 
-学習の状況は、 TensorBoard で確認することができます。
+学習の状況は、 TensorBoard で確認できます。
 
 ```sh
 tensorboard --logdir <output_dir>

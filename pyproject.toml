@@ -2,12 +2,12 @@
 name = "beatrice-trainer"
 version = "2.0.0a2"
 description = "A tool to train Beatrice models"
-authors = ["Project Beatrice <prj-beatrice@users.noreply.huggingface.co>"]
+authors = ["Project Beatrice <167534685+prj-beatrice@users.noreply.github.com>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
 python = "^3.9"
-torch = "^2"
+torch = "^2,<2.3"
 torchaudio = "^2"
 tqdm = "^4"
 numpy = "^1"
