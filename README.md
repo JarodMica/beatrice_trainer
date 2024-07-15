@@ -1,3 +1,16 @@
+---
+license: mit
+pipeline_tag: audio-to-audio
+tags:
+- audio
+- speech
+- voice-conversion
+datasets:
+- reazon-research/reazonspeech
+- dns-challenge
+- libritts-r
+---
+
 # このリポジトリは現在非公開のはずです。見えている場合はProject Beatriceにご連絡ください
 
 # Beatrice Trainer
@@ -13,7 +26,7 @@ Beatrice 2 は、以下を目標に開発されています。
 * 公式 VST での変換時、外部の録音機器を使った実測で 50ms 程度の遅延
 * 開発者のノート PC (Intel Core i7-1165G7) でシングルスレッドで動作させ、RTF < 0.25 となる程度の負荷
 * 最小構成で 30MB 以下の容量
-* VST と VCClient での動作
+* VST と [VC Client](https://github.com/w-okada/voice-changer) での動作
 * その他 (内緒)
 
 ## Getting Started
@@ -24,16 +37,19 @@ Git などを使用して、このリポジトリをダウンロードしてく�
 
 ```sh
 git lfs install
-git clone (TBW)
+git clone https://huggingface.co/fierce-cats/beatrice-trainer
 cd beatrice-trainer
 ```
 
 ### 2. Environment Setup
 
 Poetry などを使用して、依存ライブラリをインストールしてください。
+
 ```sh
 poetry install
 poetry shell
+# Alternatively, you can use pip to install dependencies directly:
+# pip3 install -e .
 ```
 
 正しくインストールできていれば、 `python3 beatrice_trainer -h` で以下のようなヘルプが表示されます。
@@ -105,7 +121,7 @@ tensorboard --logdir <output_dir>
 ### 5. After Training
 
 学習が正常に完了すると、出力ディレクトリ内に `paraphernalia_(data_dir_name)_(step)` という名前のディレクトリが生成されています。
-このディレクトリを公式 VST や VCClient で読み込むことで、ストリーム (リアルタイム) 変換を行うことができます。
+このディレクトリを公式 VST や [VC Client](https://github.com/w-okada/voice-changer) で読み込むことで、ストリーム (リアルタイム) 変換を行うことができます。
 
 ## Detailed Usage
 
@@ -146,22 +162,21 @@ python3 beatrice_trainer -d <your_training_data_dir> -o <output_dir> -r
 
 ### Customize Paraphernalia
 
-学習スクリプトによって生成された paraphernalia ディレクトリ内にある `beatrice_paraphernalia_*.toml` ファイルを編集することで、 VST や VCClient 上での表示を変更できます。 (願望)
+学習スクリプトによって生成された paraphernalia ディレクトリ内にある `beatrice_paraphernalia_*.toml` ファイルを編集することで、 VST や VC Client 上での表示を変更できます。
 
 ## Resource
 
 このリポジトリには、学習などに使用する各種データが含まれています。
-詳しくは [assets/README.md](/assets/README.md) をご覧ください。
+詳しくは [assets/README.md](https://huggingface.co/fierce-cats/beatrice-trainer/blob/main/assets/README.md) をご覧ください。
 
 ## Reference
 
-* [wav2vec 2.0](https://github.com/facebookresearch/fairseq)
-* [EnCodec](https://github.com/facebookresearch/encodec)
-* [HiFi-GAN](https://github.com/jik876/hifi-gan)
-* [Vocos](https://github.com/gemelo-ai/vocos)
-* [BigVSAN](https://github.com/sony/bigvsan)
-* [UnivNet](https://arxiv.org/abs/2106.07889)
-  * [unofficial implementation](https://github.com/maum-ai/univnet)
+* [wav2vec 2.0](https://arxiv.org/abs/2006.11477) ([Official implementation](https://github.com/facebookresearch/fairseq), [MIT License](https://github.com/facebookresearch/fairseq/blob/main/LICENSE))
+* [EnCodec](https://arxiv.org/abs/2210.13438) ([Official implementation](https://github.com/facebookresearch/encodec), [MIT License](https://github.com/facebookresearch/encodec/blob/main/LICENSE))
+* [HiFi-GAN](https://arxiv.org/abs/2010.05646) ([Official implementation](https://github.com/jik876/hifi-gan), [MIT License](https://github.com/jik876/hifi-gan/blob/master/LICENSE))
+* [Vocos](https://arxiv.org/abs/2306.00814) ([Official implementation](https://github.com/gemelo-ai/vocos), [MIT License](https://github.com/gemelo-ai/vocos/blob/main/LICENSE))
+* [BigVSAN](https://arxiv.org/abs/2309.02836) ([Official implementation](https://github.com/sony/bigvsan), [MIT License](https://github.com/sony/bigvsan/blob/main/LICENSE))
+* [UnivNet](https://arxiv.org/abs/2106.07889) ([Unofficial implementation](https://github.com/maum-ai/univnet), [BSD 3-Clause License](https://github.com/maum-ai/univnet/blob/master/LICENSE))
 * [Soft-VC](https://arxiv.org/abs/2111.02392)
 * [StreamVC](https://arxiv.org/abs/2401.03078)
 * [EVA-GAN](https://arxiv.org/abs/2402.00892)
@@ -170,5 +185,5 @@ python3 beatrice_trainer -d <your_training_data_dir> -o <output_dir> -r
 
 ## License
 
-このリポジトリ内のソースコードおよび学習済みモデルは (TBW) のもとで公開されています。
-詳しくは [LICENSE](/LICENSE) をご覧ください。
+このリポジトリ内のソースコードおよび学習済みモデルは MIT License のもとで公開されています。
+詳しくは [LICENSE](https://huggingface.co/fierce-cats/beatrice-trainer/blob/main/LICENSE) をご覧ください。

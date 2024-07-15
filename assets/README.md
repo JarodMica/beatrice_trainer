@@ -15,7 +15,7 @@
 ## Pretrained
 
 Beatrice の事前学習済みモデルです。
-[ReazonSpeech](https://huggingface.co/datasets/reazon-research/reazonspeech), [DNS-Chellenge](https://github.com/microsoft/DNS-Challenge), [LibriTTS-R (予定)](https://www.openslr.org/141/) のデータを使用して学習されています。
+[ReazonSpeech](https://huggingface.co/datasets/reazon-research/reazonspeech), [DNS-Chellenge](https://github.com/microsoft/DNS-Challenge), [LibriTTS-R](https://www.openslr.org/141/) のデータを使用して学習されています。
 
 ## Test
 

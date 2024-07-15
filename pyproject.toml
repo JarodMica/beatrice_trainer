@@ -1,9 +1,12 @@
 [tool.poetry]
 name = "beatrice-trainer"
-version = "2.0.0a2"
+version = "2.0.0b0"
 description = "A tool to train Beatrice models"
+license = "MIT"
 authors = ["Project Beatrice <167534685+prj-beatrice@users.noreply.github.com>"]
 readme = "README.md"
+homepage = "https://prj-beatrice.com/"
+repository = "https://huggingface.co/fierce-cats/beatrice-trainer"
 
 [tool.poetry.dependencies]
 python = "^3.9"
