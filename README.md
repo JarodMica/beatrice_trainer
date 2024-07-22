@@ -164,6 +164,20 @@ python3 beatrice_trainer -d <your_training_data_dir> -o <output_dir> -r
 
 学習スクリプトによって生成された paraphernalia ディレクトリ内にある `beatrice_paraphernalia_*.toml` ファイルを編集することで、 VST や VC Client 上での表示を変更できます。
 
+`model.version` は、生成されたモデルのフォーマットバージョンを表すため、変更しないでください。
+
+各 `description` は、長すぎると全文が表示されない場合があります。
+現在表示できていても、将来的な VST や VC Client の仕様変更により表示できなくなる可能性があるため、余裕を持った文字数・行数に収めてください。
+
+`portrait` に設定する画像は、 PNG 形式かつ正方形としてください。
+
+## Distribution of Trained Models
+
+このリポジトリを用いて生成したモデルの配布を歓迎します。
+
+配布されたモデルは、 Project Beatrice およびその関係者の管理する SNS アカウントやウェブサイト上でご紹介させていただく場合があります。
+その際、 `portrait` に設定された画像を掲載することがありますので、予めご承知おきください。
+
 ## Resource
 
 このリポジトリには、学習などに使用する各種データが含まれています。
