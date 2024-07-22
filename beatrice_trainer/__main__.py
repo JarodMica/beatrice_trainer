@@ -63,7 +63,7 @@ dict_default_hparams = {
     "grad_balancer_ema_decay": 0.995,
     "use_amp": True,
     "num_workers": 16,
-    "n_steps": 100000,
+    "n_steps": 20000,
     "warmup_steps": 10000,
     "in_sample_rate": 16000,  # 変更不可
     "out_sample_rate": 24000,  # 変更不可
