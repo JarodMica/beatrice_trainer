@@ -15,7 +15,7 @@ datasets:
 
 # Beatrice Trainer
 
-超低遅延・低負荷・低容量を特徴とする完全無料の声質変換 VST 「Beatrice 2」の学習ツールキットです。
+超低遅延・低負荷・低容量を特徴とする完全無料の声質変換 VST 「[Beatrice 2](https://prj-beatrice.com)」のモデル学習用ツールキットです。
 
 Beatrice 2 は、以下を目標に開発されています。
 
@@ -28,6 +28,14 @@ Beatrice 2 は、以下を目標に開発されています。
 * 最小構成で 30MB 以下の容量
 * VST と [VC Client](https://github.com/w-okada/voice-changer) での動作
 * その他 (内緒)
+
+## Prerequisites
+
+Beatrice は、既存の学習済みモデルを用いて声質の変換を行うだけであれば GPU を必要としません。
+しかし、新たなモデルの作成を効率良く行うためには GPU が必要です。
+
+学習スクリプトを実行すると、デフォルト設定では 9GB 程度の VRAM を消費します。
+GeForce RTX 4090 を使用した場合、 1 時間程度で学習が完了します。
 
 ## Getting Started
 
@@ -121,7 +129,7 @@ tensorboard --logdir <output_dir>
 ### 5. After Training
 
 学習が正常に完了すると、出力ディレクトリ内に `paraphernalia_(data_dir_name)_(step)` という名前のディレクトリが生成されています。
-このディレクトリを公式 VST や [VC Client](https://github.com/w-okada/voice-changer) で読み込むことで、ストリーム (リアルタイム) 変換を行うことができます。
+このディレクトリを[公式 VST](https://prj-beatrice.com) や [VC Client](https://github.com/w-okada/voice-changer) で読み込むことで、ストリーム (リアルタイム) 変換を行うことができます。
 
 ## Detailed Usage
 
