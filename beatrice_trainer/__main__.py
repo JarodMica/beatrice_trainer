@@ -2724,6 +2724,7 @@ if __name__ == "__main__":
         # === 4. 検証 ===
         if (iteration + 1) % 50000 == 0 or iteration + 1 in {
             1,
+            5000,
             10000,
             30000,
             h.n_steps,
@@ -2819,6 +2820,7 @@ if __name__ == "__main__":
         # === 5. 保存 ===
         if (iteration + 1) % 50000 == 0 or iteration + 1 in {
             1,
+            5000,
             10000,
             30000,
             h.n_steps,
