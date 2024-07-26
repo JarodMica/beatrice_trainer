@@ -2746,8 +2746,10 @@ if __name__ == "__main__":
                     source_wav = source_wav.to(device)
                     original_source_wav_length = source_wav.size(1)
                     # 長さのパターンを減らしてキャッシュを効かせる
-                    if source_wav.size(1) % h.in_sample_rate != 0:
-                        source_wav = F.pad(
+                    if source_wav.size(1) % h.in_sample_rate == 0:
+                        padded_source_wav = source_wav
+                    else:
+                        padded_source_wav = F.pad(
                             source_wav,
                             (
                                 0,
@@ -2756,7 +2758,7 @@ if __name__ == "__main__":
                             ),
                         )
                     converted = net_g(
-                        source_wav[[0] * len(target_ids), None],
+                        padded_source_wav[[0] * len(target_ids), None],
                         torch.tensor(target_ids, device=device),
                         torch.tensor(
                             [0.0] * len(target_ids), device=device
