@@ -11,8 +11,6 @@ datasets:
 - libritts-r
 ---
 
-# このリポジトリは現在非公開のはずです。見えている場合はProject Beatriceにご連絡ください
-
 # Beatrice Trainer
 
 超低遅延・低負荷・低容量を特徴とする完全無料の声質変換 VST 「[Beatrice 2](https://prj-beatrice.com)」のモデル学習用ツールキットです。
