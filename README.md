@@ -35,6 +35,10 @@ Beatrice は、既存の学習済みモデルを用いて声質の変換を行�
 学習スクリプトを実行すると、デフォルト設定では 9GB 程度の VRAM を消費します。
 GeForce RTX 4090 を使用した場合、 1 時間程度で学習が完了します。
 
+GPU を手元に用意できない場合でも、以下のリポジトリを使用して Google Colab 上で学習を行うことができます。
+
+* [w-okada/beatrice-trainer-colab](https://github.com/w-okada/beatrice-trainer-colab)
+
 ## Getting Started
 
 ### 1. Download This Repo
