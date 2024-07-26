@@ -2347,12 +2347,11 @@ def prepare_training():
                 while True:
                     yield from range(n_speakers)
 
+        target_id_generator = get_target_id_generator()
         for file in sorted(in_test_wav_dir.iterdir())[:max_n_test_files]:
             if file.suffix.lower() not in AUDIO_FILE_SUFFIXES:
                 continue
-            target_ids = [
-                next(get_target_id_generator()) for _ in range(min(8, n_speakers))
-            ]
+            target_ids = [next(target_id_generator) for _ in range(min(8, n_speakers))]
             test_filelist.append((file, target_ids))
         return test_filelist
 
@@ -2777,10 +2776,10 @@ if __name__ == "__main__":
                         for d in range(
                             min(len(target_ids), 1 + (12 - i - 1) // len(test_filelist))
                         ):
-                            idx_in_barch = n_added_wavs % len(target_ids)
+                            idx_in_batch = n_added_wavs % len(target_ids)
                             writer.add_audio(
-                                f"converted/y_hat_{i:02d}_{target_ids[0]:03d}_{pitch_shift_semitones[0]:+02d}",
-                                converted[0],
+                                f"converted/y_hat_{i:02d}_{target_ids[idx_in_batch]:03d}_{pitch_shift_semitones[idx_in_batch]:+02d}",
+                                converted[idx_in_batch],
                                 iteration + 1,
                                 h.out_sample_rate,
                             )
