@@ -8,7 +8,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from torch.nn.utils import remove_weight_norm, weight_norm
 
-from src.network_utils import dump_layer, ConvNeXtStack
+from beatrice_trainer.src.network_utils import dump_layer, ConvNeXtStack
 
 class FeatureProjection(nn.Module):
     def __init__(self, in_channels: int, out_channels: int):

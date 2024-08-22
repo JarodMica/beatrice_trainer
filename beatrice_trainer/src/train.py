@@ -24,12 +24,12 @@ from torch.nn.utils import remove_weight_norm, weight_norm
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
-from src.utils import *
-from src.dataset import WavDataset, get_resampler
-from src.feature_processing import PhoneExtractor, PitchEstimator
-from src.vocoder import ConverterNetwork
-from src.discriminator import MultiPeriodDiscriminator
-from src.network_utils import dump_layer
+from beatrice_trainer.src.utils import *
+from beatrice_trainer.src.dataset import WavDataset, get_resampler
+from beatrice_trainer.src.feature_processing import PhoneExtractor, PitchEstimator
+from beatrice_trainer.src.vocoder import ConverterNetwork
+from beatrice_trainer.src.discriminator import MultiPeriodDiscriminator
+from beatrice_trainer.src.network_utils import dump_layer
 
 def prepare_training(data_dir, out_dir, resume=False, config=None):
     # 各種準備をする

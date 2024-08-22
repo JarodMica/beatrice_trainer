@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "beatrice_trainer"
+version = "1.0"
+description = "Installable package for beatrice trainer"
+authors = [
+    { name = "Jarod Mica" }
+]
+
+dependencies = [
+]
+
+requires-python = ">=3.9"
+
+
+[project.urls]
+repository = "https://github.com/JarodMica/beatrice_trainer"
+
+[tool.setuptools.packages.find]
+include = ["beatrice_trainer", "beatrice_trainer.*"]

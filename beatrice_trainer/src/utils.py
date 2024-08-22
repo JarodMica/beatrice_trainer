@@ -24,8 +24,8 @@ from torch.nn.utils import remove_weight_norm, weight_norm
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
-from src.dataset import WavDataset
-from src.feature_processing import PhoneExtractor, PitchEstimator
+from beatrice_trainer.src.dataset import WavDataset
+from beatrice_trainer.src.feature_processing import PhoneExtractor, PitchEstimator
 
 AUDIO_FILE_SUFFIXES = {
     ".wav",

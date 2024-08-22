@@ -10,8 +10,8 @@ import torchaudio
 from torch.nn import functional as F
 from torch.nn.utils import remove_weight_norm, weight_norm
 
-from src.network_utils import dump_layer, ConvNeXtStack
-from src.feature_processing import PhoneExtractor, PitchEstimator
+from beatrice_trainer.src.network_utils import dump_layer, ConvNeXtStack
+from beatrice_trainer.src.feature_processing import PhoneExtractor, PitchEstimator
 
 def overlap_add(
     ir: torch.Tensor,
