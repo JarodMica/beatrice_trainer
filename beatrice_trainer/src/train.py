@@ -47,7 +47,7 @@ def prepare_training(data_dir, out_dir, resume=False, config=None):
     #     else prepare_training_configs
     # )()
     
-    (h, in_wav_dataset_dir, out_dir, resume) = prepare_training_configs(data_dir, out_dir, resume=False, config=None)
+    (h, in_wav_dataset_dir, out_dir, resume) = prepare_training_configs(data_dir, out_dir, resume, config)
 
     print("config:")
     pprint(h)
@@ -190,6 +190,7 @@ def prepare_training(data_dir, out_dir, resume=False, config=None):
         batch_size=h.batch_size,
         pin_memory=True,
         drop_last=True,
+        persistent_workers=True
     )
 
     print("Computing mean F0s of target speakers...", end="")
@@ -400,7 +401,7 @@ def prepare_training(data_dir, out_dir, resume=False, config=None):
         writer,
     )
 
-def run_training(data_dir, out_dir, resume=False, config=None):
+def run_training(data_dir, out_dir, steps_per_epoch, epoch_save_interval, log_interval, resume=False, config=None):
     (
         device,
         in_wav_dataset_dir,
@@ -430,209 +431,204 @@ def run_training(data_dir, out_dir, resume=False, config=None):
     
     global PARAPHERNALIA_VERSION
     
-    # 学習
-    for iteration in tqdm(range(initial_iteration, h.n_steps)):
-        # === 1. データ前処理 ===
-        try:
-            batch = next(data_iter)
-        except Exception as e:
-            data_iter = iter(training_loader)
-            batch = next(data_iter)
-        (
-            clean_wavs,
-            noisy_wavs_16k,
-            slice_starts,
-            speaker_ids,
-            formant_shift_semitone,
-        ) = map(lambda x: x.to(device, non_blocking=True), batch)
+    total_epochs = (h.n_steps - initial_iteration) // steps_per_epoch
+    total_iterations = total_epochs * steps_per_epoch
 
-        # === 2.1 Discriminator の学習 ===
+    # Initialize tqdm progress bar
+    progress_bar = tqdm(total=total_iterations, initial=initial_iteration)
 
-        with torch.cuda.amp.autocast(h.use_amp):
-            # Generator
-            y, y_hat, y_hat_for_backward, loss_mel = net_g.forward_and_compute_loss(
-                noisy_wavs_16k[:, None, :],
+    for epoch in range(total_epochs):
+        for step in range(steps_per_epoch):
+            iteration = epoch * steps_per_epoch + step + initial_iteration
+
+            # === 1. Data processing ===
+            try:
+                batch = next(data_iter)
+            except Exception as e:
+                data_iter = iter(training_loader)
+                batch = next(data_iter)
+            (
+                clean_wavs,
+                noisy_wavs_16k,
+                slice_starts,
                 speaker_ids,
                 formant_shift_semitone,
-                slice_start_indices=slice_starts,
-                slice_segment_length=h.segment_length,
-                y_all=clean_wavs[:, None, :],
+            ) = map(lambda x: x.to(device, non_blocking=True), batch)
+
+            # === 2.1 Discriminator training ===
+            with torch.cuda.amp.autocast(h.use_amp):
+                y, y_hat, y_hat_for_backward, loss_mel = net_g.forward_and_compute_loss(
+                    noisy_wavs_16k[:, None, :],
+                    speaker_ids,
+                    formant_shift_semitone,
+                    slice_start_indices=slice_starts,
+                    slice_segment_length=h.segment_length,
+                    y_all=clean_wavs[:, None, :],
+                )
+                assert y_hat.isfinite().all()
+                assert loss_mel.isfinite().all()
+
+                loss_discriminator, discriminator_d_stats = (
+                    net_d.forward_and_compute_discriminator_loss(y, y_hat.detach())
+                )
+
+            optim_d.zero_grad()
+            grad_scaler.scale(loss_discriminator).backward()
+            grad_scaler.unscale_(optim_d)
+            grad_norm_d, d_grad_norm_stats = compute_grad_norm(net_d, True)
+            grad_scaler.step(optim_d)
+
+            # === 2.2 Generator training ===
+            with torch.cuda.amp.autocast(h.use_amp):
+                loss_adv, loss_fm, discriminator_g_stats = (
+                    net_d.forward_and_compute_generator_loss(y, y_hat)
+                )
+
+            optim_g.zero_grad()
+            gradient_balancer_stats = grad_balancer.backward(
+                {
+                    "loss_mel": loss_mel,
+                    "loss_adv": loss_adv,
+                    "loss_fm": loss_fm,
+                },
+                y_hat_for_backward,
+                grad_scaler,
+                skip_update_ema=iteration > 10 and iteration % 5 != 0,
             )
-            assert y_hat.isfinite().all()
-            assert loss_mel.isfinite().all()
+            grad_scaler.unscale_(optim_g)
+            grad_norm_g, g_grad_norm_stats = compute_grad_norm(net_g, True)
+            grad_scaler.step(optim_g)
+            grad_scaler.update()
 
-            # Discriminator
-            loss_discriminator, discriminator_d_stats = (
-                net_d.forward_and_compute_discriminator_loss(y, y_hat.detach())
-            )
+            # === 3. Logging ===
+            dict_scalars["loss_g/loss_mel"].append(loss_mel.item())
+            dict_scalars["loss_g/loss_fm"].append(loss_fm.item())
+            dict_scalars["loss_g/loss_adv"].append(loss_adv.item())
+            dict_scalars["other/grad_scale"].append(grad_scaler.get_scale())
+            dict_scalars["loss_d/loss_discriminator"].append(loss_discriminator.item())
+            if math.isfinite(grad_norm_d):
+                dict_scalars["other/gradient_norm_d"].append(grad_norm_d)
+                for name, value in d_grad_norm_stats.items():
+                    dict_scalars[f"~gradient_norm_d/{name}"].append(value)
+            if math.isfinite(grad_norm_g):
+                dict_scalars["other/gradient_norm_g"].append(grad_norm_g)
+                for name, value in g_grad_norm_stats.items():
+                    dict_scalars[f"~gradient_norm_g/{name}"].append(value)
+            dict_scalars["other/lr_g"].append(scheduler_g.get_last_lr()[0])
+            dict_scalars["other/lr_d"].append(scheduler_d.get_last_lr()[0])
+            for k, v in discriminator_d_stats.items():
+                dict_scalars[f"~loss_discriminator/{k}"].append(v)
+            for k, v in discriminator_g_stats.items():
+                dict_scalars[f"~loss_discriminator/{k}"].append(v)
+            for k, v in gradient_balancer_stats.items():
+                dict_scalars[f"~gradient_balancer/{k}"].append(v)
 
-        optim_d.zero_grad()
-        grad_scaler.scale(loss_discriminator).backward()
-        grad_scaler.unscale_(optim_d)
-        grad_norm_d, d_grad_norm_stats = compute_grad_norm(net_d, True)
-        grad_scaler.step(optim_d)
+            if (iteration + 1) % log_interval == 0 or iteration == 0:
+                print(f"Epoch: {epoch + 1}, Iteration: {iteration + 1}")
+                for key in ["loss_g/loss_mel", "loss_g/loss_fm", "loss_g/loss_adv", 
+                            "loss_d/loss_discriminator"]:
+                    if dict_scalars[key]:
+                        avg_value = sum(dict_scalars[key]) / len(dict_scalars[key])
+                        print(f"{key}: {avg_value:.6f}")
+                        writer.add_scalar(key, avg_value, iteration + 1)
+                        dict_scalars[key].clear()
 
-        # === 2.2 Generator の学習 ===
+            # === 4. Validation ===
+            if (epoch + 1) % epoch_save_interval == 0 or epoch == 0 or epoch == total_epochs - 1:
+                net_g.eval()
+                torch.cuda.empty_cache()
 
-        with torch.cuda.amp.autocast(h.use_amp):
-            # Discriminator
-            loss_adv, loss_fm, discriminator_g_stats = (
-                net_d.forward_and_compute_generator_loss(y, y_hat)
-            )
-
-        optim_g.zero_grad()
-        gradient_balancer_stats = grad_balancer.backward(
-            {
-                "loss_mel": loss_mel,
-                "loss_adv": loss_adv,
-                "loss_fm": loss_fm,
-            },
-            y_hat_for_backward,
-            grad_scaler,
-            skip_update_ema=iteration > 10 and iteration % 5 != 0,
-        )
-        grad_scaler.unscale_(optim_g)
-        grad_norm_g, g_grad_norm_stats = compute_grad_norm(net_g, True)
-        grad_scaler.step(optim_g)
-        grad_scaler.update()
-
-        # === 3. ログ ===
-
-        dict_scalars["loss_g/loss_mel"].append(loss_mel.item())
-        dict_scalars["loss_g/loss_fm"].append(loss_fm.item())
-        dict_scalars["loss_g/loss_adv"].append(loss_adv.item())
-        dict_scalars["other/grad_scale"].append(grad_scaler.get_scale())
-        dict_scalars["loss_d/loss_discriminator"].append(loss_discriminator.item())
-        if math.isfinite(grad_norm_d):
-            dict_scalars["other/gradient_norm_d"].append(grad_norm_d)
-            for name, value in d_grad_norm_stats.items():
-                dict_scalars[f"~gradient_norm_d/{name}"].append(value)
-        if math.isfinite(grad_norm_g):
-            dict_scalars["other/gradient_norm_g"].append(grad_norm_g)
-            for name, value in g_grad_norm_stats.items():
-                dict_scalars[f"~gradient_norm_g/{name}"].append(value)
-        dict_scalars["other/lr_g"].append(scheduler_g.get_last_lr()[0])
-        dict_scalars["other/lr_d"].append(scheduler_d.get_last_lr()[0])
-        for k, v in discriminator_d_stats.items():
-            dict_scalars[f"~loss_discriminator/{k}"].append(v)
-        for k, v in discriminator_g_stats.items():
-            dict_scalars[f"~loss_discriminator/{k}"].append(v)
-        for k, v in gradient_balancer_stats.items():
-            dict_scalars[f"~gradient_balancer/{k}"].append(v)
-
-        if (iteration + 1) % 1000 == 0 or iteration == 0:
-            for name, scalars in dict_scalars.items():
-                if scalars:
-                    writer.add_scalar(name, sum(scalars) / len(scalars), iteration + 1)
-                    scalars.clear()
-
-        # === 4. 検証 ===
-        if (iteration + 1) % 50000 == 0 or iteration + 1 in {
-            1,
-            5000,
-            10000,
-            30000,
-            h.n_steps,
-        }:
-            net_g.eval()
-            torch.cuda.empty_cache()
-
-            dict_qualities_all = defaultdict(list)
-            n_added_wavs = 0
-            with torch.inference_mode():
-                for i, ((file, target_ids), pitch_shift_semitones) in enumerate(
-                    zip(test_filelist, test_pitch_shifts)
-                ):
-                    source_wav, sr = torchaudio.load(file, backend="soundfile")
-                    source_wav = source_wav.to(device)
-                    if sr != h.in_sample_rate:
-                        source_wav = get_resampler(sr, h.in_sample_rate, device)(
-                            source_wav
-                        )
-                    source_wav = source_wav.to(device)
-                    original_source_wav_length = source_wav.size(1)
-                    # 長さのパターンを減らしてキャッシュを効かせる
-                    if source_wav.size(1) % h.in_sample_rate == 0:
-                        padded_source_wav = source_wav
-                    else:
-                        padded_source_wav = F.pad(
-                            source_wav,
-                            (
-                                0,
-                                h.in_sample_rate
-                                - source_wav.size(1) % h.in_sample_rate,
-                            ),
-                        )
-                    converted = net_g(
-                        padded_source_wav[[0] * len(target_ids), None],
-                        torch.tensor(target_ids, device=device),
-                        torch.tensor(
-                            [0.0] * len(target_ids), device=device
-                        ),  # フォルマントシフト
-                        torch.tensor(
-                            [float(p) for p in pitch_shift_semitones], device=device
-                        ),
-                    ).squeeze_(1)[:, : original_source_wav_length // 160 * 240]
-                    if i < 12:
-                        if iteration == 0:
-                            writer.add_audio(
-                                f"source/y_{i:02d}",
+                dict_qualities_all = defaultdict(list)
+                n_added_wavs = 0
+                with torch.inference_mode():
+                    for i, ((file, target_ids), pitch_shift_semitones) in enumerate(
+                        zip(test_filelist, test_pitch_shifts)
+                    ):
+                        source_wav, sr = torchaudio.load(file, backend="soundfile")
+                        source_wav = source_wav.to(device)
+                        if sr != h.in_sample_rate:
+                            source_wav = get_resampler(sr, h.in_sample_rate, device)(
+                                source_wav
+                            )
+                        source_wav = source_wav.to(device)
+                        original_source_wav_length = source_wav.size(1)
+                        if source_wav.size(1) % h.in_sample_rate == 0:
+                            padded_source_wav = source_wav
+                        else:
+                            padded_source_wav = F.pad(
                                 source_wav,
-                                iteration + 1,
-                                h.in_sample_rate,
+                                (
+                                    0,
+                                    h.in_sample_rate
+                                    - source_wav.size(1) % h.in_sample_rate,
+                                ),
                             )
-                        for d in range(
-                            min(len(target_ids), 1 + (12 - i - 1) // len(test_filelist))
-                        ):
-                            idx_in_batch = n_added_wavs % len(target_ids)
-                            writer.add_audio(
-                                f"converted/y_hat_{i:02d}_{target_ids[idx_in_batch]:03d}_{pitch_shift_semitones[idx_in_batch]:+02d}",
-                                converted[idx_in_batch],
-                                iteration + 1,
-                                h.out_sample_rate,
-                            )
-                            n_added_wavs += 1
-                    converted = resample_to_in_sample_rate(converted)
-                    quality = quality_tester.test(converted, source_wav)
-                    for metric_name, values in quality.items():
-                        dict_qualities_all[metric_name].extend(values)
-            assert n_added_wavs == min(
-                12, len(test_filelist) * len(test_filelist[0][1])
-            ), (
-                n_added_wavs,
-                len(test_filelist),
-                len(speakers),
-                len(test_filelist[0][1]),
-            )
-            dict_qualities = {
-                metric_name: sum(values) / len(values)
-                for metric_name, values in dict_qualities_all.items()
-                if len(values)
-            }
-            for metric_name, value in dict_qualities.items():
-                writer.add_scalar(f"validation/{metric_name}", value, iteration + 1)
-            for metric_name, values in dict_qualities_all.items():
-                for i, value in enumerate(values):
-                    writer.add_scalar(
-                        f"~validation_{metric_name}/{i:03d}", value, iteration + 1
-                    )
-            del dict_qualities, dict_qualities_all
+                        converted = net_g(
+                            padded_source_wav[[0] * len(target_ids), None],
+                            torch.tensor(target_ids, device=device),
+                            torch.tensor(
+                                [0.0] * len(target_ids), device=device
+                            ),
+                            torch.tensor(
+                                [float(p) for p in pitch_shift_semitones], device=device
+                            ),
+                        ).squeeze_(1)[:, : original_source_wav_length // 160 * 240]
+                        if i < 12:
+                            if epoch == 0 and step == 0:
+                                writer.add_audio(
+                                    f"source/y_{i:02d}",
+                                    source_wav,
+                                    iteration + 1,
+                                    h.in_sample_rate,
+                                )
+                            for d in range(
+                                min(len(target_ids), 1 + (12 - i - 1) // len(test_filelist))
+                            ):
+                                idx_in_batch = n_added_wavs % len(target_ids)
+                                writer.add_audio(
+                                    f"converted/y_hat_{i:02d}_{target_ids[idx_in_batch]:03d}_{pitch_shift_semitones[idx_in_batch]:+02d}",
+                                    converted[idx_in_batch],
+                                    iteration + 1,
+                                    h.out_sample_rate,
+                                )
+                                n_added_wavs += 1
+                        converted = resample_to_in_sample_rate(converted)
+                        quality = quality_tester.test(converted, source_wav)
+                        for metric_name, values in quality.items():
+                            dict_qualities_all[metric_name].extend(values)
+                assert n_added_wavs == min(
+                    12, len(test_filelist) * len(test_filelist[0][1])
+                ), (
+                    n_added_wavs,
+                    len(test_filelist),
+                    len(speakers),
+                    len(test_filelist[0][1]),
+                )
+                dict_qualities = {
+                    metric_name: sum(values) / len(values)
+                    for metric_name, values in dict_qualities_all.items()
+                    if len(values)
+                }
+                for metric_name, value in dict_qualities.items():
+                    writer.add_scalar(f"validation/{metric_name}", value, iteration + 1)
+                for metric_name, values in dict_qualities_all.items():
+                    for i, value in enumerate(values):
+                        writer.add_scalar(
+                            f"~validation_{metric_name}/{i:03d}", value, iteration + 1
+                        )
+                del dict_qualities, dict_qualities_all
 
-            gc.collect()
-            net_g.train()
-            torch.cuda.empty_cache()
+                gc.collect()
+                net_g.train()
+                torch.cuda.empty_cache()
+                
+                # Update the progress bar
+            progress_bar.update(1)
 
-        # === 5. 保存 ===
-        print(f"Starting iteration: {iteration}")
-        if (iteration + 1) % 50000 == 0 or iteration + 1 in {
-            1,
-            5000,
-            10000,
-            30000,
-            h.n_steps,
-        }:
-            print(f"Saving checkpoint at iteration: {iteration + 1}")
-                    # チェックポイント
+
+        # === 5. Save checkpoint at specified epoch intervals ===
+        if (epoch + 1) % epoch_save_interval == 0 or epoch == total_epochs - 1:
+            print(f"Saving checkpoint at epoch: {epoch + 1}, iteration: {iteration + 1}")
             name = f"{in_wav_dataset_dir.name}_{iteration + 1:08d}"
             checkpoint_file_save = out_dir / f"checkpoint_{name}.pt"
             if checkpoint_file_save.exists():
@@ -656,7 +652,7 @@ def run_training(data_dir, out_dir, resume=False, config=None):
             )
             shutil.copy(checkpoint_file_save, out_dir / "checkpoint_latest.pt")
 
-            # 推論用
+            # Save model for inference
             paraphernalia_dir = out_dir / f"paraphernalia_{name}"
             if paraphernalia_dir.exists():
                 paraphernalia_dir = paraphernalia_dir.with_name(
@@ -728,11 +724,13 @@ description = """
                     )
             del paraphernalia_dir
 
-        # TODO: phone_extractor, pitch_estimator が既知のモデルであれば dump を省略
+            
+    # Close the progress bar after training is complete
+    progress_bar.close()
 
-        # === 6. スケジューラ更新 ===
-        scheduler_g.step()
-        scheduler_d.step()
+    # === 6. Scheduler update ===
+    scheduler_g.step()
+    scheduler_d.step()
 
 
 
