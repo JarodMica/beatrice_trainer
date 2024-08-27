@@ -190,7 +190,7 @@ def prepare_training(data_dir, out_dir, resume=False, config=None):
         batch_size=h.batch_size,
         pin_memory=True,
         drop_last=True,
-        persistent_workers=True
+        persistent_workers=True # Default was False.  Thought there was an issue with TRUE not training other speakers, but it did on a subsequent run
     )
 
     print("Computing mean F0s of target speakers...", end="")
@@ -573,37 +573,37 @@ def run_training(data_dir, out_dir, steps_per_epoch, epoch_save_interval, log_in
                                 [float(p) for p in pitch_shift_semitones], device=device
                             ),
                         ).squeeze_(1)[:, : original_source_wav_length // 160 * 240]
-                        if i < 12:
-                            if epoch == 0 and step == 0:
-                                writer.add_audio(
-                                    f"source/y_{i:02d}",
-                                    source_wav,
-                                    iteration + 1,
-                                    h.in_sample_rate,
-                                )
-                            for d in range(
-                                min(len(target_ids), 1 + (12 - i - 1) // len(test_filelist))
-                            ):
-                                idx_in_batch = n_added_wavs % len(target_ids)
-                                writer.add_audio(
-                                    f"converted/y_hat_{i:02d}_{target_ids[idx_in_batch]:03d}_{pitch_shift_semitones[idx_in_batch]:+02d}",
-                                    converted[idx_in_batch],
-                                    iteration + 1,
-                                    h.out_sample_rate,
-                                )
-                                n_added_wavs += 1
+                        # if i < 12:
+                        #     if epoch == 0 and step == 0:
+                        #         writer.add_audio(
+                        #             f"source/y_{i:02d}",
+                        #             source_wav,
+                        #             iteration + 1,
+                        #             h.in_sample_rate,
+                        #         )
+                        #     for d in range(
+                        #         min(len(target_ids), 1 + (12 - i - 1) // len(test_filelist))
+                        #     ):
+                        #         idx_in_batch = n_added_wavs % len(target_ids)
+                        #         writer.add_audio(
+                        #             f"converted/y_hat_{i:02d}_{target_ids[idx_in_batch]:03d}_{pitch_shift_semitones[idx_in_batch]:+02d}",
+                        #             converted[idx_in_batch],
+                        #             iteration + 1,
+                        #             h.out_sample_rate,
+                        #         )
+                        #         n_added_wavs += 1
                         converted = resample_to_in_sample_rate(converted)
                         quality = quality_tester.test(converted, source_wav)
                         for metric_name, values in quality.items():
                             dict_qualities_all[metric_name].extend(values)
-                assert n_added_wavs == min(
-                    12, len(test_filelist) * len(test_filelist[0][1])
-                ), (
-                    n_added_wavs,
-                    len(test_filelist),
-                    len(speakers),
-                    len(test_filelist[0][1]),
-                )
+                # assert n_added_wavs == min(
+                #     12, len(test_filelist) * len(test_filelist[0][1])
+                # ), (
+                #     n_added_wavs,
+                #     len(test_filelist),
+                #     len(speakers),
+                #     len(test_filelist[0][1]),
+                # )
                 dict_qualities = {
                     metric_name: sum(values) / len(values)
                     for metric_name, values in dict_qualities_all.items()
@@ -624,6 +624,9 @@ def run_training(data_dir, out_dir, steps_per_epoch, epoch_save_interval, log_in
                 
                 # Update the progress bar
             progress_bar.update(1)
+            
+            scheduler_g.step()
+            scheduler_d.step()
 
 
         # === 5. Save checkpoint at specified epoch intervals ===
@@ -728,9 +731,9 @@ description = """
     # Close the progress bar after training is complete
     progress_bar.close()
 
-    # === 6. Scheduler update ===
-    scheduler_g.step()
-    scheduler_d.step()
+    # # === 6. Scheduler update ===
+    # scheduler_g.step()
+    # scheduler_d.step()
 
 
 
