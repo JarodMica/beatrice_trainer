@@ -1,6 +1,8 @@
 {
-    "learning_rate": 1e-4,
-    "min_learning_rate": 5e-6,
+    "learning_rate_g": 2e-4,
+    "learning_rate_d": 1e-4,
+    "min_learning_rate_g": 1e-5,
+    "min_learning_rate_d": 5e-6,
     "adam_betas": [
         0.8,
         0.99
@@ -8,13 +10,14 @@
     "adam_eps": 1e-6,
     "batch_size": 8,
     "grad_weight_mel": 1.0,
-    "grad_weight_adv": 1.0,
-    "grad_weight_fm": 1.0,
+    "grad_weight_ap": 2.0,
+    "grad_weight_adv": 3.0,
+    "grad_weight_fm": 3.0,
     "grad_balancer_ema_decay": 0.995,
     "use_amp": true,
     "num_workers": 16,
-    "n_steps": 20000,
-    "warmup_steps": 10000,
+    "n_steps": 10000,
+    "warmup_steps": 2000,
     "in_sample_rate": 16000,
     "out_sample_rate": 24000,
     "wav_length": 96000,
@@ -24,7 +27,11 @@
     "in_ir_wav_dir": "assets/ir",
     "in_noise_wav_dir": "assets/noise",
     "in_test_wav_dir": "assets/test",
-    "pretrained_file": "assets/pretrained/040c_checkpoint_libritts_r_200_02300000.pt",
+    "pretrained_file": "assets/pretrained/079_checkpoint_libritts_r_200_02400000.pt",
     "hidden_channels": 256,
-    "san": false
+    "san": false,
+    "compile_convnext": false,
+    "compile_d4c": false,
+    "compile_discriminator": false,
+    "profile": false
 }

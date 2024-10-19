@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "beatrice-trainer"
-version = "2.0.0b0"
+version = "2.0.0b2"
 description = "A tool to train Beatrice models"
 license = "MIT"
 authors = ["Project Beatrice <167534685+prj-beatrice@users.noreply.github.com>"]
@@ -9,14 +9,25 @@ homepage = "https://prj-beatrice.com/"
 repository = "https://huggingface.co/fierce-cats/beatrice-trainer"
 
 [tool.poetry.dependencies]
-python = "^3.9"
-torch = "^2,<2.3"
-torchaudio = "^2"
-tqdm = "^4"
+python = ">=3.9"
+torch = [
+    { version = ">=2.1", markers = "sys_platform == 'win32'", source = "torch-cuda" },
+    { version = ">=2.1", markers = "sys_platform != 'win32'" },
+]
+torchaudio = [
+    { version = ">=2.1", markers = "sys_platform == 'win32'", source = "torch-cuda" },
+    { version = ">=2.1", markers = "sys_platform != 'win32'" },
+]
+tqdm = ">=4"
 numpy = "^1"
-tensorboard = "^2"
-soundfile = "^0.11"
-pyworld = "^0.3.2"
+tensorboard = ">=2"
+soundfile = ">=0.11"
+pyworld = ">=0.3.2"
+
+[[tool.poetry.source]]
+name = "torch-cuda"
+url = "https://download.pytorch.org/whl/cu121"
+priority = "explicit"
 
 [build-system]
 requires = ["poetry-core"]

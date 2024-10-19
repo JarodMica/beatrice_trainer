@@ -27,13 +27,33 @@ Beatrice 2 は、以下を目標に開発されています。
 * VST と [VC Client](https://github.com/w-okada/voice-changer) での動作
 * その他 (内緒)
 
+## Release Notes
+
+* **2024-10-20**: Beatrice Trainer 2.0.0-beta.2 をリリースしました。
+  * **[公式 VST](https://prj-beatrice.com) や [VC Client](https://github.com/w-okada/voice-changer) を最新版にアップデートしてください。新しい Trainer で生成したモデルは、古いバージョンの公式 VST や VC Client で動作しません。**
+  * [Scaled Weight Standardization](https://arxiv.org/abs/2101.08692) の導入により、学習の安定性が向上しました。
+  * 無音に非常に近い音声に対する損失の計算結果が nan になる問題を修正し、学習の安定性が向上しました。
+  * 周期信号の生成方法を変更し、事前学習モデルを用いない場合により少ない学習ステップ数で高品質な変換音声を生成できるようになりました。
+  * [FIRNet](https://ast-astrec.nict.go.jp/release/preprints/preprint_icassp_2024_ohtani.pdf) に着想を得たポストフィルタ構造を導入し、変換音声の品質が向上しました。
+  * [D4C](https://www.sciencedirect.com/science/article/pii/S0167639316300413) を損失関数に導入し、変換音声の品質が向上しました。
+  * [Multi-scale mel loss](https://arxiv.org/abs/2306.06546) を導入しました。
+  * 冗長な逆伝播の除去や `torch.backends.cudnn.benchmark` の部分的な無効化などにより、学習速度が向上しました。
+  * 学習データにモノラルでない音声ファイルが含まれる場合にエラーが発生する問題を修正しました。
+  * 音量計算の誤りを修正し、学習時と推論時の変換結果の不一致が解消されました。
+  * PyTorch のバージョンの下限を修正しました。
+  * Windows 環境で CPU 版の PyTorch がインストールされる問題を修正しました。
+  * Windows 環境で DataLoader の動作が非常に遅くなる問題を修正しました。
+  * その他いくつかの変更を行いました。
+* **2024-07-27**: Beatrice Trainer 2.0.0-beta.0 をリリースしました。
+
+
 ## Prerequisites
 
 Beatrice は、既存の学習済みモデルを用いて声質の変換を行うだけであれば GPU を必要としません。
 しかし、新たなモデルの作成を効率良く行うためには GPU が必要です。
 
 学習スクリプトを実行すると、デフォルト設定では 9GB 程度の VRAM を消費します。
-GeForce RTX 4090 を使用した場合、 1 時間程度で学習が完了します。
+GeForce RTX 4090 を使用した場合、 30 分程度で学習が完了します。
 
 GPU を手元に用意できない場合でも、以下のリポジトリを使用して Google Colab 上で学習を行うことができます。
 
@@ -122,6 +142,8 @@ your_training_data_dir_with_only_one_speaker
 python3 beatrice_trainer -d <your_training_data_dir> -o <output_dir>
 ```
 
+(Windowns の場合、 `beatrice_trainer` の代わりに `.\beatrice_trainer\__main__.py` を指定しないと正しく動作しないという報告があります。)
+
 学習の状況は、 TensorBoard で確認できます。
 
 ```sh
@@ -132,6 +154,7 @@ tensorboard --logdir <output_dir>
 
 学習が正常に完了すると、出力ディレクトリ内に `paraphernalia_(data_dir_name)_(step)` という名前のディレクトリが生成されています。
 このディレクトリを[公式 VST](https://prj-beatrice.com) や [VC Client](https://github.com/w-okada/voice-changer) で読み込むことで、ストリーム (リアルタイム) 変換を行うことができます。
+**読み込めない場合は公式 VST や VC Client のバージョンが古い可能性がありますので、最新のバージョンにアップデートしてください。**
 
 ## Detailed Usage
 
@@ -196,16 +219,35 @@ python3 beatrice_trainer -d <your_training_data_dir> -o <output_dir> -r
 ## Reference
 
 * [wav2vec 2.0](https://arxiv.org/abs/2006.11477) ([Official implementation](https://github.com/facebookresearch/fairseq), [MIT License](https://github.com/facebookresearch/fairseq/blob/main/LICENSE))
+  * FeatureExtractor の実装に利用。
 * [EnCodec](https://arxiv.org/abs/2210.13438) ([Official implementation](https://github.com/facebookresearch/encodec), [MIT License](https://github.com/facebookresearch/encodec/blob/main/LICENSE))
+  * GradBalancer の実装に利用。
 * [HiFi-GAN](https://arxiv.org/abs/2010.05646) ([Official implementation](https://github.com/jik876/hifi-gan), [MIT License](https://github.com/jik876/hifi-gan/blob/master/LICENSE))
+  * DiscriminatorP の実装に利用。
 * [Vocos](https://arxiv.org/abs/2306.00814) ([Official implementation](https://github.com/gemelo-ai/vocos), [MIT License](https://github.com/gemelo-ai/vocos/blob/main/LICENSE))
+  * ConvNeXtBlock の実装に利用。
 * [BigVSAN](https://arxiv.org/abs/2309.02836) ([Official implementation](https://github.com/sony/bigvsan), [MIT License](https://github.com/sony/bigvsan/blob/main/LICENSE))
-* [UnivNet](https://arxiv.org/abs/2106.07889) ([Unofficial implementation](https://github.com/maum-ai/univnet), [BSD 3-Clause License](https://github.com/maum-ai/univnet/blob/master/LICENSE))
+  * SAN モジュールの実装に利用。
+* [D4C](https://www.sciencedirect.com/science/article/pii/S0167639316300413) ([Unofficial implementation by tuanad121](https://github.com/tuanad121/Python-WORLD), [MIT License](https://github.com/tuanad121/Python-WORLD/blob/master/LICENSE.txt))
+  * 損失関数の実装に利用。
+* [UnivNet](https://arxiv.org/abs/2106.07889) ([Unofficial implementation by maum-ai](https://github.com/maum-ai/univnet), [BSD 3-Clause License](https://github.com/maum-ai/univnet/blob/master/LICENSE))
+  * DiscriminatorR の実装に利用。
+* [NF-ResNets](https://arxiv.org/abs/2101.08692)
+  * Scaled Weight Standardization のアイデアを利用。
 * [Soft-VC](https://arxiv.org/abs/2111.02392)
+  * PhoneExtractor の基本的なアイデアとして利用。
+* [Descript Audio Codec](https://arxiv.org/abs/2306.06546)
+  * Multi-scale mel loss のアイデアを利用。
 * [StreamVC](https://arxiv.org/abs/2401.03078)
+  * 声質変換スキームの基本的なアイデアとして利用。
+* [FIRNet](https://ast-astrec.nict.go.jp/release/preprints/preprint_icassp_2024_ohtani.pdf)
+  * FIR フィルタを Vocoder に適用するアイデアを利用。
 * [EVA-GAN](https://arxiv.org/abs/2402.00892)
+  * SiLU を vocoder に適用するアイデアを利用。
 * [Subramani et al., 2024](https://arxiv.org/abs/2309.14507)
+  * PitchEstimator の基本的なアイデアとして利用。
 * [Agrawal et al., 2024](https://arxiv.org/abs/2401.10460)
+  * Vocoder の基本的なアイデアとして利用。
 
 ## License
 
