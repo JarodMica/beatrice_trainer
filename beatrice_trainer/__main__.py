@@ -4,6 +4,7 @@
 # %%
 import argparse
 import gc
+import gzip
 import json
 import math
 import os
@@ -17,7 +18,7 @@ from functools import partial
 from pathlib import Path
 from pprint import pprint
 from random import Random
-from typing import BinaryIO, Literal, Optional, Union
+from typing import BinaryIO, Literal, Optional, Union, Sequence, Iterable, Callable
 
 import numpy as np
 import pyworld
@@ -40,7 +41,7 @@ if not hasattr(torch.amp, "GradScaler"):
 
 
 # モジュールのバージョンではない
-PARAPHERNALIA_VERSION = "2.0.0-beta.1"
+PARAPHERNALIA_VERSION = "2.0.0-rc.0"
 
 
 def is_notebook() -> bool:
@@ -59,35 +60,51 @@ def repo_root() -> Path:
 # ハイパーパラメータ
 # 学習データや出力ディレクトリなど、学習ごとに変わるようなものはここに含めない
 dict_default_hparams = {
-    # train
-    "learning_rate_g": 2e-4,
-    "learning_rate_d": 1e-4,
-    "min_learning_rate_g": 1e-5,
-    "min_learning_rate_d": 5e-6,
+    # training
+    "learning_rate_g": 5e-5,
+    "learning_rate_d": 5e-5,
+    "learning_rate_decay": 0.999999,
     "adam_betas": [0.8, 0.99],
     "adam_eps": 1e-6,
     "batch_size": 8,
-    "grad_weight_mel": 1.0,  # grad_weight は比が同じなら同じ意味になるはず
-    "grad_weight_ap": 2.0,
-    "grad_weight_adv": 3.0,
-    "grad_weight_fm": 3.0,
+    "grad_weight_loudness": 1.0,  # grad_weight は比が同じなら同じ意味になるはず
+    "grad_weight_mel": 50.0,
+    "grad_weight_ap": 100.0,
+    "grad_weight_adv": 150.0,
+    "grad_weight_fm": 150.0,
     "grad_balancer_ema_decay": 0.995,
     "use_amp": True,
     "num_workers": 16,
     "n_steps": 10000,
-    "warmup_steps": 2000,
+    "warmup_steps": 5000,
+    "evaluation_interval": 2000,
+    "save_interval": 2000,
     "in_sample_rate": 16000,  # 変更不可
     "out_sample_rate": 24000,  # 変更不可
     "wav_length": 4 * 24000,  # 4s
     "segment_length": 100,  # 1s
+    "phone_noise_ratio": 0.5,
+    "vq_topk": 4,
+    "training_time_vq": "none",  # "none", "self" or "random"
+    "floor_noise_level": 1e-3,
+    "record_metrics": False,
+    # augmentation
+    "augmentation_snr_candidates": [20.0, 25.0, 30.0, 35.0, 40.0, 45.0],
+    "augmentation_formant_shift_probability": 0.5,
+    "augmentation_formant_shift_semitone_min": -3.0,
+    "augmentation_formant_shift_semitone_max": 3.0,
+    "augmentation_reverb_probability": 0.5,
+    "augmentation_lpf_probability": 0.2,
+    "augmentation_lpf_cutoff_freq_candidates": [2000.0, 3000.0, 4000.0, 6000.0],
     # data
-    "phone_extractor_file": "assets/pretrained/003b_checkpoint_03000000.pt",
-    "pitch_estimator_file": "assets/pretrained/008_1_checkpoint_00300000.pt",
+    "phone_extractor_file": "assets/pretrained/122_checkpoint_03000000.pt",
+    "pitch_estimator_file": "assets/pretrained/104_3_checkpoint_00300000.pt",
     "in_ir_wav_dir": "assets/ir",
     "in_noise_wav_dir": "assets/noise",
     "in_test_wav_dir": "assets/test",
-    "pretrained_file": "assets/pretrained/079_checkpoint_libritts_r_200_02400000.pt",  # None も可
+    "pretrained_file": "assets/pretrained/151_checkpoint_libritts_r_200_02750000.pt.gz",  # None も可
     # model
+    "pitch_bins": 448,  # 変更不可
     "hidden_channels": 256,  # ファインチューン時変更不可、変更した場合は推論側の対応必要
     "san": False,  # ファインチューン時変更不可
     "compile_convnext": False,
@@ -118,8 +135,8 @@ if __name__ == "__main__":
 
 
 def prepare_training_configs_for_experiment() -> tuple[dict, Path, Path, bool, bool]:
-    import ipynbname
-    from IPython import get_ipython
+    import ipynbname  # type: ignore[import]
+    from IPython import get_ipython  # type: ignore[import]
 
     h = deepcopy(dict_default_hparams)
     in_wav_dataset_dir = repo_root() / "../../data/processed/libritts_r_200"
@@ -228,28 +245,38 @@ def dump_layer(layer: nn.Module, f: BinaryIO):
     elif isinstance(layer, (nn.Linear, nn.Conv1d, nn.LayerNorm)):
         dump(layer.weight)
         dump(layer.bias)
-    elif isinstance(layer, nn.ConvTranspose1d):
-        dump(layer.weight.transpose(0, 1))
-        dump(layer.bias)
-    elif isinstance(layer, nn.GRU):
-        dump(layer.weight_ih_l0)
-        dump(layer.bias_ih_l0)
-        dump(layer.weight_hh_l0)
-        dump(layer.bias_hh_l0)
-        for i in range(1, 99999):
-            if not hasattr(layer, f"weight_ih_l{i}"):
-                break
-            dump(getattr(layer, f"weight_ih_l{i}"))
-            dump(getattr(layer, f"bias_ih_l{i}"))
-            dump(getattr(layer, f"weight_hh_l{i}"))
-            dump(getattr(layer, f"bias_hh_l{i}"))
+    elif isinstance(layer, nn.MultiheadAttention):
+        embed_dim = layer.embed_dim
+        num_heads = layer.num_heads
+        # [3 * embed_dim, embed_dim]
+        in_proj_weight = layer.in_proj_weight.data.clone()
+        in_proj_weight[: 2 * embed_dim] *= 1.0 / math.sqrt(
+            math.sqrt(embed_dim // num_heads)
+        )
+        in_proj_weight = in_proj_weight.view(
+            3, num_heads, embed_dim // num_heads, embed_dim
+        )
+        # [num_heads, 3, embed_dim / num_heads, embed_dim]
+        in_proj_weight = in_proj_weight.transpose(0, 1)
+        # [3 * embed_dim]
+        in_proj_bias = layer.in_proj_bias.data.clone()
+        in_proj_bias[: 2 * embed_dim] *= 1.0 / math.sqrt(
+            math.sqrt(embed_dim // num_heads)
+        )
+        in_proj_bias = in_proj_bias.view(3, num_heads, embed_dim // num_heads)
+        # [num_heads, 3, embed_dim / num_heads]
+        in_proj_bias = in_proj_bias.transpose(0, 1)
+        dump(in_proj_weight)
+        dump(in_proj_bias)
+        dump(layer.out_proj.weight)
+        dump(layer.out_proj.bias)
     elif isinstance(layer, nn.Embedding):
         dump(layer.weight)
     elif isinstance(layer, nn.Parameter):
         dump(layer)
     elif isinstance(layer, nn.ModuleList):
-        for l in layer:
-            dump_layer(l, f)
+        for layer_i in layer:
+            dump_layer(layer_i, f)
     else:
         assert False, layer
 
@@ -368,6 +395,136 @@ class WSLinear(nn.Linear):
         self.gain.data.fill_(1.0)
 
 
+class CrossAttention(nn.Module):
+    def __init__(
+        self,
+        qk_channels: int,
+        vo_channels: int,
+        num_heads: int,
+        in_q_channels: int,
+        in_kv_channels: int,
+        out_channels: int,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        assert qk_channels % num_heads == 0
+        self.qk_channels = qk_channels
+        self.vo_channels = vo_channels
+        self.num_heads = num_heads
+        self.in_q_channels = in_q_channels
+        self.in_kv_channels = in_kv_channels
+        self.out_channels = out_channels
+        self.dropout = dropout
+        self.head_qk_channels = qk_channels // num_heads
+        self.head_vo_channels = vo_channels // num_heads
+        self.q_projection = nn.Linear(in_q_channels, qk_channels)
+        self.q_projection.weight.data.normal_(0.0, math.sqrt(1.0 / in_q_channels))
+        self.q_projection.bias.data.zero_()
+        self.kv_projection = nn.Linear(in_kv_channels, qk_channels + vo_channels)
+        self.kv_projection.weight.data.normal_(0.0, math.sqrt(1.0 / in_kv_channels))
+        self.kv_projection.bias.data.zero_()
+        self.out_projection = nn.Linear(vo_channels, out_channels)
+        self.out_projection.weight.data.normal_(0.0, math.sqrt(1.0 / vo_channels))
+        self.out_projection.bias.data.zero_()
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+    ) -> torch.Tensor:
+        # q: [batch_size, q_length, in_q_channels]
+        # kv: [batch_size, kv_length, in_kv_channels]
+        batch_size, q_length, _ = q.size()
+        _, kv_length, _ = kv.size()
+        # [batch_size, q_length, qk_channels]
+        q = self.q_projection(q)
+        # [batch_size, kv_length, qk_channels + vo_channels]
+        kv = self.kv_projection(kv)
+        # [batch_size, kv_length, qk_channels], [batch_size, kv_length, vo_channels]
+        k, v = kv.split([self.qk_channels, self.vo_channels], dim=2)
+        q = q.view(
+            batch_size, q_length, self.num_heads, self.head_qk_channels
+        ).transpose(1, 2)
+        k = k.view(
+            batch_size, kv_length, self.num_heads, self.head_qk_channels
+        ).transpose(1, 2)
+        v = v.view(
+            batch_size, kv_length, self.num_heads, self.head_vo_channels
+        ).transpose(1, 2)
+        # [batch_size, num_heads, q_length, head_vo_channels]
+        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout)
+        # [batch_size, q_length, vo_channels]
+        attn_out = (
+            attn_out.transpose(1, 2)
+            .contiguous()
+            .view(batch_size, q_length, self.vo_channels)
+        )
+        # [batch_size, q_length, out_channels]
+        attn_out = self.out_projection(attn_out)
+        return attn_out
+
+    def dump(self, f: Union[BinaryIO, str, bytes, os.PathLike]):
+        if isinstance(f, (str, bytes, os.PathLike)):
+            with open(f, "wb") as f:
+                self.dump(f)
+            return
+        if not hasattr(f, "write"):
+            raise TypeError
+
+        q_projection_weight = self.q_projection.weight.data.clone()
+        q_projection_bias = self.q_projection.bias.data.clone()
+        q_projection_weight *= 1.0 / math.sqrt(math.sqrt(self.head_qk_channels))
+        q_projection_bias *= 1.0 / math.sqrt(math.sqrt(self.head_qk_channels))
+        dump_params(q_projection_weight, f)
+        dump_params(q_projection_bias, f)
+        dump_layer(self.out_projection, f)
+
+    def dump_kv(self, f: Union[BinaryIO, str, bytes, os.PathLike]):
+        if isinstance(f, (str, bytes, os.PathLike)):
+            with open(f, "wb") as f:
+                self.dump_kv(f)
+            return
+        if not hasattr(f, "write"):
+            raise TypeError
+
+        kv_projection_weight = self.kv_projection.weight.data.clone()
+        kv_projection_bias = self.kv_projection.bias.data.clone()
+        k_projection_weight, v_projection_weight = kv_projection_weight.split(
+            [self.qk_channels, self.vo_channels]
+        )
+        k_projection_bias, v_projection_bias = kv_projection_bias.split(
+            [self.qk_channels, self.vo_channels]
+        )
+        k_projection_weight *= 1.0 / math.sqrt(math.sqrt(self.head_qk_channels))
+        k_projection_bias *= 1.0 / math.sqrt(math.sqrt(self.head_qk_channels))
+        # [qk_channels, in_kv_channels] -> [num_heads, head_qk_channels, in_kv_channels]
+        k_projection_weight = k_projection_weight.view(
+            self.num_heads, self.head_qk_channels, self.in_kv_channels
+        )
+        # [qk_channels] -> [num_heads, head_qk_channels]
+        k_projection_bias = k_projection_bias.view(
+            self.num_heads, self.head_qk_channels
+        )
+        # [vo_channels, in_kv_channels] -> [num_heads, head_vo_channels, in_kv_channels]
+        v_projection_weight = v_projection_weight.view(
+            self.num_heads, self.head_vo_channels, self.in_kv_channels
+        )
+        # [vo_channels] -> [num_heads, head_vo_channels]
+        v_projection_bias = v_projection_bias.view(
+            self.num_heads, self.head_vo_channels
+        )
+        for i in range(self.num_heads):
+            # [head_qk_channels, in_kv_channels]
+            dump_params(k_projection_weight[i], f)
+            # [head_vo_channels, in_kv_channels]
+            dump_params(v_projection_weight[i], f)
+        for i in range(self.num_heads):
+            # [head_qk_channels]
+            dump_params(k_projection_bias[i], f)
+            # [head_vo_channels]
+            dump_params(v_projection_bias[i], f)
+
+
 class ConvNeXtBlock(nn.Module):
     def __init__(
         self,
@@ -379,10 +536,39 @@ class ConvNeXtBlock(nn.Module):
         enable_scaling: bool = False,
         pre_scale: float = 1.0,
         post_scale: float = 1.0,
+        use_mha: bool = False,
+        cross_attention: bool = False,
+        num_heads: int = 4,
+        attention_dropout: float = 0.1,
+        attention_channels: Optional[int] = None,
+        kv_channels: Optional[int] = None,
     ):
         super().__init__()
         self.use_weight_standardization = use_weight_standardization
         self.enable_scaling = enable_scaling
+        self.use_mha = use_mha
+        self.cross_attention = cross_attention
+        if use_mha:
+            self.attn_norm = nn.LayerNorm(channels)
+            if cross_attention:
+                self.mha = CrossAttention(
+                    qk_channels=attention_channels,
+                    vo_channels=attention_channels,
+                    num_heads=num_heads,
+                    in_q_channels=channels,
+                    in_kv_channels=kv_channels,
+                    out_channels=channels,
+                    dropout=attention_dropout,
+                )
+            else:  # self-attention
+                assert attention_channels is None
+                assert kv_channels is None
+                self.mha = nn.MultiheadAttention(
+                    embed_dim=channels,
+                    num_heads=num_heads,
+                    dropout=attention_dropout,
+                    batch_first=True,
+                )
         self.dwconv = CausalConv1d(
             channels, channels, kernel_size=kernel_size, groups=channels
         )
@@ -407,7 +593,39 @@ class ConvNeXtBlock(nn.Module):
             self.register_buffer("post_scale", torch.tensor(post_scale))
             self.post_scale_weight = nn.Parameter(torch.ones(()))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        kv: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.use_mha:
+            batch_size, channels, length = x.size()
+            if self.cross_attention:
+                assert kv is not None
+            else:
+                assert kv is None
+                assert length % 4 == 0
+            identity = x
+            if self.cross_attention:
+                # kv: [batch_size, kv_length, kv_channels]
+                x = x.transpose(1, 2)
+                x = self.attn_norm(x)
+                x = self.mha(x, kv)
+                x = x.transpose(1, 2)
+            else:
+                x = x.view(batch_size, channels, length // 4, 4)
+                x = x.permute(0, 3, 2, 1)
+                x = x.reshape(batch_size * 4, length // 4, channels)
+                x = self.attn_norm(x)
+                x, _ = self.mha(
+                    x, x, x, attn_mask=attn_mask, is_causal=True, need_weights=False
+                )
+                x = x.view(batch_size, 4, length // 4, channels)
+                x = x.permute(0, 3, 2, 1)
+                x = x.reshape(batch_size, channels, length)
+            x += identity
+
         identity = x
         if self.enable_scaling:
             x = x * self.pre_scale
@@ -426,14 +644,31 @@ class ConvNeXtBlock(nn.Module):
         return x
 
     def merge_weights(self):
+        if self.use_mha:
+            if self.cross_attention:
+                assert isinstance(self.mha, CrossAttention)
+                self.mha.q_projection.bias.data += torch.mv(
+                    self.mha.q_projection.weight.data, self.attn_norm.bias.data
+                )
+                self.mha.q_projection.weight.data *= self.attn_norm.weight.data[None, :]
+                self.attn_norm.bias.data[:] = 0.0
+                self.attn_norm.weight.data[:] = 1.0
+            else:  # self-attention
+                assert isinstance(self.mha, nn.MultiheadAttention)
+                self.mha.in_proj_bias.data += torch.mv(
+                    self.mha.in_proj_weight.data, self.attn_norm.bias.data
+                )
+                self.mha.in_proj_weight.data *= self.attn_norm.weight.data[None, :]
+                self.attn_norm.bias.data[:] = 0.0
+                self.attn_norm.weight.data[:] = 1.0
         if self.use_weight_standardization:
             self.dwconv.merge_weights()
             self.pwconv1.merge_weights()
             self.pwconv2.merge_weights()
         else:
-            self.pwconv1.bias.data += (
-                self.norm.bias.data[None, :] * self.pwconv1.weight.data
-            ).sum(1)
+            self.pwconv1.bias.data += torch.mv(
+                self.pwconv1.weight.data, self.norm.bias.data
+            )
             self.pwconv1.weight.data *= self.norm.weight.data[None, :]
             self.norm.bias.data[:] = 0.0
             self.norm.weight.data[:] = 1.0
@@ -458,6 +693,8 @@ class ConvNeXtBlock(nn.Module):
         if not hasattr(f, "write"):
             raise TypeError
 
+        if self.use_mha:
+            dump_layer(self.mha, f)
         dump_layer(self.dwconv, f)
         dump_layer(self.pwconv1, f)
         dump_layer(self.pwconv2, f)
@@ -475,10 +712,16 @@ class ConvNeXtStack(nn.Module):
         kernel_size: int,
         use_weight_standardization: bool = False,
         enable_scaling: bool = False,
+        use_mha: bool = False,
+        cross_attention: bool = False,
+        kv_channels: Optional[int] = None,
     ):
         super().__init__()
         assert delay * 2 + 1 <= embed_kernel_size
+        assert not (use_weight_standardization and use_mha)  # 未対応
         self.use_weight_standardization = use_weight_standardization
+        self.use_mha = use_mha
+        self.cross_attention = cross_attention
         self.embed = CausalConv1d(in_channels, channels, embed_kernel_size, delay=delay)
         self.norm = nn.LayerNorm(channels)
         self.convnext = nn.ModuleList()
@@ -494,6 +737,12 @@ class ConvNeXtStack(nn.Module):
                 enable_scaling=enable_scaling,
                 pre_scale=pre_scale,
                 post_scale=post_scale,
+                use_mha=use_mha,
+                cross_attention=cross_attention,
+                num_heads=4,
+                attention_dropout=0.1,
+                attention_channels=kv_channels,
+                kv_channels=kv_channels,
             )
             self.convnext.append(block)
         self.final_layer_norm = nn.LayerNorm(channels)
@@ -506,11 +755,25 @@ class ConvNeXtStack(nn.Module):
             self.norm = nn.Identity()
             self.final_layer_norm = nn.Identity()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, kv: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         x = self.embed(x)
         x = self.norm(x.transpose(1, 2)).transpose(1, 2)
+        if self.use_mha and not self.cross_attention:
+            pad_length = -x.size(2) % 4
+            if pad_length:
+                x = F.pad(x, (0, pad_length))
+            t40 = x.size(2) // 4
+            attn_mask = torch.ones((t40, t40), dtype=torch.bool, device=x.device).triu(
+                1
+            )
+        else:
+            attn_mask = None
         for conv_block in self.convnext:
-            x = conv_block(x)
+            x = conv_block(x, attn_mask=attn_mask, kv=kv)
+        if self.use_mha and not self.cross_attention and pad_length:
+            x = x[:, :, :-pad_length]
         x = self.final_layer_norm(x.transpose(1, 2)).transpose(1, 2)
         return x
 
@@ -534,6 +797,23 @@ class ConvNeXtStack(nn.Module):
         dump_layer(self.convnext, f)
         if not self.use_weight_standardization:
             dump_layer(self.final_layer_norm, f)
+
+    def dump_kv(self, f: Union[BinaryIO, str, bytes, os.PathLike]):
+        if isinstance(f, (str, bytes, os.PathLike)):
+            with open(f, "wb") as f:
+                self.dump_kv(f)
+            return
+        if not hasattr(f, "write"):
+            raise TypeError
+
+        assert self.use_mha and self.cross_attention
+        for conv_block in self.convnext:
+            if not conv_block.use_mha or not conv_block.cross_attention:
+                continue
+            assert isinstance(conv_block, ConvNeXtBlock)
+            assert hasattr(conv_block, "mha")
+            assert isinstance(conv_block.mha, CrossAttention)
+            conv_block.mha.dump_kv(f)
 
 
 class FeatureExtractor(nn.Module):
@@ -588,64 +868,30 @@ class FeatureExtractor(nn.Module):
 
 
 class FeatureProjection(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int):
+    def __init__(self, channels: int):
         super().__init__()
-        self.norm = nn.LayerNorm(in_channels)
-        self.projection = nn.Conv1d(in_channels, out_channels, 1)
+        self.norm = nn.LayerNorm(channels)
         self.dropout = nn.Dropout(0.1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # [batch_size, channels, length]
         x = self.norm(x.transpose(1, 2)).transpose(1, 2)
-        x = self.projection(x)
         x = self.dropout(x)
         return x
-
-    def merge_weights(self):
-        self.projection.bias.data += (
-            (self.norm.bias.data[None, :, None] * self.projection.weight.data)
-            .sum(1)
-            .squeeze(1)
-        )
-        self.projection.weight.data *= self.norm.weight.data[None, :, None]
-        self.norm.bias.data[:] = 0.0
-        self.norm.weight.data[:] = 1.0
-
-    def dump(self, f: Union[BinaryIO, str, bytes, os.PathLike]):
-        if isinstance(f, (str, bytes, os.PathLike)):
-            with open(f, "wb") as f:
-                self.dump(f)
-            return
-        if not hasattr(f, "write"):
-            raise TypeError
-
-        dump_layer(self.projection, f)
 
 
 class PhoneExtractor(nn.Module):
     def __init__(
         self,
-        phone_channels: int = 256,
-        hidden_channels: int = 256,
-        backbone_embed_kernel_size: int = 7,
+        phone_channels: int = 128,
+        hidden_channels: int = 128,
+        backbone_embed_kernel_size: int = 9,
         kernel_size: int = 17,
-        n_blocks: int = 8,
+        n_blocks: int = 20,
     ):
         super().__init__()
         self.feature_extractor = FeatureExtractor(hidden_channels)
-        self.feature_projection = FeatureProjection(hidden_channels, hidden_channels)
-        self.n_speaker_encoder_layers = 3
-        self.speaker_encoder = nn.GRU(
-            hidden_channels,
-            hidden_channels,
-            self.n_speaker_encoder_layers,
-            batch_first=True,
-        )
-        for i in range(self.n_speaker_encoder_layers):
-            for input_char in "ih":
-                self.speaker_encoder = weight_norm(
-                    self.speaker_encoder, f"weight_{input_char}h_l{i}"
-                )
+        self.feature_projection = FeatureProjection(hidden_channels)
         self.backbone = ConvNeXtStack(
             in_channels=hidden_channels,
             channels=hidden_channels,
@@ -654,6 +900,7 @@ class PhoneExtractor(nn.Module):
             delay=0,
             embed_kernel_size=backbone_embed_kernel_size,
             kernel_size=kernel_size,
+            use_mha=True,
         )
         self.head = weight_norm(nn.Conv1d(hidden_channels, phone_channels, 1))
 
@@ -670,36 +917,14 @@ class PhoneExtractor(nn.Module):
             stats["feature_norm"] = x.detach().norm(dim=1).mean()
         # [batch_size, feature_extractor_hidden_channels, length] -> [batch_size, hidden_channels, length]
         x = self.feature_projection(x)
-        # [batch_size, hidden_channels, length] -> [batch_size, length, hidden_channels]
-        g, _ = self.speaker_encoder(x.transpose(1, 2))
-        if self.training:
-            batch_size, length, _ = g.size()
-            shuffle_sizes_for_each_data = torch.randint(
-                0, 50, (batch_size,), device=g.device
-            )
-            max_indices = torch.arange(length, device=g.device)[None, :, None]
-            min_indices = (
-                max_indices - shuffle_sizes_for_each_data[:, None, None]
-            ).clamp_(min=0)
-            with torch.cuda.amp.autocast(False):
-                indices = (
-                    torch.rand(g.size(), device=g.device)
-                    * (max_indices - min_indices + 1)
-                ).long() + min_indices
-            assert indices.min() >= 0, indices.min()
-            assert indices.max() < length, (indices.max(), length)
-            g = g.gather(1, indices)
-
-        # [batch_size, length, hidden_channels] -> [batch_size, hidden_channels, length]
-        g = g.transpose(1, 2).contiguous()
         # [batch_size, hidden_channels, length]
-        x = self.backbone(x + g)
+        x = self.backbone(x)
         # [batch_size, hidden_channels, length] -> [batch_size, phone_channels, length]
         phone = self.head(F.gelu(x, approximate="tanh"))
 
         results = [phone]
         if return_stats:
-            stats["code_norm"] = phone.detach().norm(dim=1).mean().item()
+            stats["code_norm"] = phone.detach().norm(dim=1).mean()
             results.append(stats)
 
         if len(results) == 1:
@@ -719,14 +944,24 @@ class PhoneExtractor(nn.Module):
 
     def remove_weight_norm(self):
         self.feature_extractor.remove_weight_norm()
-        for i in range(self.n_speaker_encoder_layers):
-            for input_char in "ih":
-                remove_weight_norm(self.speaker_encoder, f"weight_{input_char}h_l{i}")
         remove_weight_norm(self.head)
 
     def merge_weights(self):
-        self.feature_projection.merge_weights()
         self.backbone.merge_weights()
+
+        self.backbone.embed.bias.data += (
+            (
+                self.feature_projection.norm.bias.data[None, :, None]
+                * self.backbone.embed.weight.data  # [o, i, k]
+            )
+            .sum(1)
+            .sum(1)
+        )
+        self.backbone.embed.weight.data *= self.feature_projection.norm.weight.data[
+            None, :, None
+        ]
+        self.feature_projection.norm.bias.data[:] = 0.0
+        self.feature_projection.norm.weight.data[:] = 1.0
 
     def dump(self, f: Union[BinaryIO, str, bytes, os.PathLike]):
         if isinstance(f, (str, bytes, os.PathLike)):
@@ -737,10 +972,185 @@ class PhoneExtractor(nn.Module):
             raise TypeError
 
         dump_layer(self.feature_extractor, f)
-        dump_layer(self.feature_projection, f)
-        dump_layer(self.speaker_encoder, f)
         dump_layer(self.backbone, f)
         dump_layer(self.head, f)
+
+
+class VectorQuantizer(nn.Module):
+    def __init__(
+        self,
+        n_speakers: int,
+        codebook_size: int,
+        channels: int,
+        topk: int = 4,
+        training_time_vq: Literal["none", "self", "random"] = "none",
+    ):
+        super().__init__()
+        assert 1 <= topk <= codebook_size
+        self.n_speakers = n_speakers
+        self.codebook_size = codebook_size
+        self.channels = channels
+        self.topk = topk
+        self.training_time_vq = training_time_vq
+
+        self.register_buffer(
+            "codebooks",
+            torch.empty(n_speakers, codebook_size, channels, dtype=torch.half),
+        )
+        self.codebooks: torch.Tensor
+
+        # VQ の適用箇所を変更しやすいように hook にしている
+        self._hook_handle: Optional[torch.utils.hooks.RemovableHandle] = None
+        self.target_speaker_ids: Optional[torch.Tensor] = None
+
+        def _hook(_, __, output):
+            return self(output, self.target_speaker_ids)
+
+        self._hook_fn = _hook
+
+    @torch.no_grad()
+    def build_codebooks(
+        self,
+        collector_func: Callable,
+        target_layer: nn.Module,
+        inputs: Sequence[Iterable[torch.Tensor]],
+        kmeans_n_iters: int = 50,
+    ):
+        assert len(inputs) == self.n_speakers
+        assert self._hook_handle is None, "hook already installed"
+        device = next(self.buffers()).device
+
+        for spk_id, inps in enumerate(tqdm(inputs, desc="Building codebooks")):
+            activations: list[torch.Tensor] = []
+
+            # TODO: データ多すぎる場合に間引く処理をする
+
+            def _collect(_, __, output):
+                # output: [batch_size, channels, length]
+                activations.append(output.detach())
+
+            handle = target_layer.register_forward_hook(_collect)
+            for x in inps:
+                collector_func(x.to(device))
+            handle.remove()
+
+            if not activations:
+                raise RuntimeError(f"No activation collected for speaker {spk_id}")
+
+            # [n_data, channels]
+            activations: torch.Tensor = torch.cat(
+                [
+                    a.transpose(1, 2).reshape(a.size(0) * a.size(2), self.channels)
+                    for a in activations
+                ]
+            )
+            activations = activations.float()
+            activations = F.normalize(activations, dim=1, eps=1e-6)
+            # [codebook_size, channels]
+            centers = (
+                self._kmeans_plus_plus(activations, self.codebook_size, kmeans_n_iters)
+                if activations.size(0) >= self.codebook_size
+                else self._pad_replicate(activations, self.codebook_size)
+            )
+            self.codebooks[spk_id] = centers.to(self.codebooks.dtype)
+
+    def forward(
+        self, x: torch.Tensor, speaker_ids: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        batch_size, channels, length = x.size()
+        assert channels == self.channels
+        device = x.device
+        dtype = x.dtype
+
+        if self.training:
+            if self.training_time_vq == "none":
+                return x
+            elif self.training_time_vq == "self":
+                if self.target_speaker_ids is None:
+                    raise ValueError("target_speaker_ids is not set")
+            elif self.training_time_vq == "random":
+                speaker_ids = torch.randint(
+                    0, self.n_speakers, (batch_size,), device=device
+                )
+            else:
+                raise ValueError(f"Unknown training_time_vq: {self.training_time_vq}")
+        else:
+            if speaker_ids is None:
+                return x
+            speaker_ids = speaker_ids.to(device)
+
+        # [batch_size, channels, length] → [batch_size, length, channels]
+        q = F.normalize(x, dim=1, eps=1e-6)
+        codes = self.codebooks[speaker_ids].to(q.dtype)
+        # [batch_size, length, codebook_size]
+        sim = torch.einsum("bcl,bkc->blk", q, codes)
+
+        # [batch_size, length, topk]
+        _, topk_idx = sim.topk(self.topk, dim=-1)
+        # [batch_size, length, codebook_size, channels]
+        expanded_codes = codes[:, None, :, :].expand(-1, length, -1, -1)
+        # [batch_size, length, topk, channels]
+        expanded_topk_idx = topk_idx[:, :, :, None].expand(-1, -1, -1, channels)
+        # [batch_size, length, topk, channels]
+        gathered = expanded_codes.gather(2, expanded_topk_idx)
+        # [batch_size, length, channels]
+        gathered = gathered.mean(2)
+        # [batch_size, channels, length]
+        return gathered.transpose(1, 2).to(dtype)
+
+    def enable_hook(self, target_layer: nn.Module):
+        if self._hook_handle is not None:
+            raise RuntimeError("hook already installed")
+        self._hook_handle = target_layer.register_forward_hook(self._hook_fn)
+
+    def disable_hook(self):
+        if self._hook_handle is None:
+            raise RuntimeError("hook not installed")
+        self._hook_handle.remove()
+        self._hook_handle = None
+
+    def set_target_speaker_ids(self, speaker_ids: Optional[torch.Tensor]):
+        # この話者が使われる条件は forward() を参照
+        self.target_speaker_ids = speaker_ids
+
+    @staticmethod
+    def _pad_replicate(x: torch.Tensor, n: int) -> torch.Tensor:
+        # データ数が n に満たないとき適当に複製して埋める
+        idx = torch.arange(n, device=x.device) % x.size(0)
+        return x[idx]
+
+    @staticmethod
+    def _kmeans_plus_plus(
+        x: torch.Tensor, n_clusters: int, n_iters: int = 50
+    ) -> torch.Tensor:
+        n_data, _ = x.size()
+        center_indices = [torch.randint(0, n_data, ()).item()]
+        min_distances = torch.full((n_data,), math.inf, device=x.device)
+        for _ in range(1, n_clusters):
+            last_center_index = center_indices[-1]
+            min_distances = min_distances.minimum(
+                torch.cdist(x, x[last_center_index : last_center_index + 1])
+                .float()
+                .square_()
+                .squeeze_(1)
+            )
+            probs = min_distances / (min_distances.sum() + 1e-12)
+            center_indices.append(torch.multinomial(probs, 1).item())
+        centers = x[center_indices]
+        del min_distances, probs
+        for _ in range(n_iters):
+            distances = torch.cdist(x, centers)  # [n_data, n_clusters]
+            labels = distances.argmin(1)  # [n_data]
+            # [n_clusters, dim]
+            new_centers = torch.zeros_like(centers).index_add_(0, labels, x)
+            # [n_clusters]
+            counts = labels.bincount(minlength=n_clusters)
+            if (counts == 0).sum().item() != 0:
+                # TODO: 割り当てがないクラスタの処理
+                warnings.warn("Some clusters have no assigned data points.")
+            new_centers /= counts[:, None].clamp_(min=1).float()
+            centers = new_centers
+        return centers
 
 
 # %% [markdown]
@@ -790,7 +1200,6 @@ def extract_pitch_features(
     )
 
     # 自己相関
-    # 余裕があったら LPC 残差にするのも試したい
     # 元々これに 2.0 / corr_win_length を掛けて使おうと思っていたが、
     # この値は振幅の 2 乗に比例していて、NN に入力するために良い感じに分散を
     # 標準化する方法が思いつかなかったのでやめた
@@ -836,17 +1245,17 @@ class PitchEstimator(nn.Module):
         self,
         input_instfreq_channels: int = 192,
         input_corr_channels: int = 256,
-        pitch_channels: int = 384,
+        pitch_bins: int = 448,
         channels: int = 192,
-        intermediate_channels: int = 192 * 3,
-        n_blocks: int = 6,
+        intermediate_channels: int = 192 * 2,
+        n_blocks: int = 9,
         delay: int = 1,  # 10ms, 特徴抽出と合わせると 22.5ms
         embed_kernel_size: int = 3,
         kernel_size: int = 33,
-        bins_per_octave: int = 96,
+        pitch_bins_per_octave: int = 96,
     ):
         super().__init__()
-        self.bins_per_octave = bins_per_octave
+        self.pitch_bins_per_octave = pitch_bins_per_octave
 
         self.instfreq_embed_0 = nn.Conv1d(input_instfreq_channels, channels, 1)
         self.instfreq_embed_1 = nn.Conv1d(channels, channels, 1)
@@ -860,8 +1269,9 @@ class PitchEstimator(nn.Module):
             delay,
             embed_kernel_size,
             kernel_size,
+            enable_scaling=True,
         )
-        self.head = nn.Conv1d(channels, pitch_channels, 1)
+        self.head = nn.Conv1d(channels, pitch_bins, 1)
 
     def forward(self, wav: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # wav: [batch_size, 1, wav_length]
@@ -884,32 +1294,30 @@ class PitchEstimator(nn.Module):
         corr_diff = F.gelu(self.corr_embed_0(corr_diff), approximate="tanh")
         corr_diff = self.corr_embed_1(corr_diff)
         # [batch_size, channels, length]
-        x = instfreq_features + corr_diff  # ここ活性化関数忘れてる
+        x = F.gelu(instfreq_features + corr_diff, approximate="tanh")
         x = self.backbone(x)
-        # [batch_size, pitch_channels, length]
+        # [batch_size, pitch_bins, length]
         x = self.head(x)
         return x, energy
 
     def sample_pitch(
-        self, pitch: torch.Tensor, band_width: int = 48, return_features: bool = False
+        self, pitch: torch.Tensor, band_width: int = 4, return_features: bool = False
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        # pitch: [batch_size, pitch_channels, length]
+        # pitch: [batch_size, pitch_bins, length]
         # 返されるピッチの値には 0 は含まれない
-        batch_size, pitch_channels, length = pitch.size()
+        batch_size, pitch_bins, length = pitch.size()
         pitch = pitch.softmax(1)
         if return_features:
             unvoiced_proba = pitch[:, :1, :].clone()
         pitch[:, 0, :] = -100.0
         pitch = (
-            pitch.transpose(1, 2)
-            .contiguous()
-            .view(batch_size * length, 1, pitch_channels)
+            pitch.transpose(1, 2).contiguous().view(batch_size * length, 1, pitch_bins)
         )
         band_pitch = F.conv1d(
             pitch,
             torch.ones((1, 1, 1), device=pitch.device).expand(1, 1, band_width),
         )
-        # [batch_size * length, 1, pitch_channels - band_width + 1] -> Long[batch_size * length, 1]
+        # [batch_size * length, 1, pitch_bins - band_width + 1] -> Long[batch_size * length, 1]
         quantized_band_pitch = band_pitch.argmax(2)
         if return_features:
             # [batch_size * length, 1]
@@ -917,29 +1325,33 @@ class PitchEstimator(nn.Module):
             # [batch_size * length, 1]
             half_pitch_band_proba = band_pitch.gather(
                 2,
-                (quantized_band_pitch - self.bins_per_octave).clamp_(min=1)[:, :, None],
+                (quantized_band_pitch - self.pitch_bins_per_octave).clamp_(min=1)[
+                    :, :, None
+                ],
             )
-            half_pitch_band_proba[quantized_band_pitch <= self.bins_per_octave] = 0.0
+            half_pitch_band_proba[
+                quantized_band_pitch <= self.pitch_bins_per_octave
+            ] = 0.0
             half_pitch_proba = (half_pitch_band_proba / (band_proba + 1e-6)).view(
                 batch_size, 1, length
             )
             # [batch_size * length, 1]
             double_pitch_band_proba = band_pitch.gather(
                 2,
-                (quantized_band_pitch + self.bins_per_octave).clamp_(
-                    max=pitch_channels - band_width
+                (quantized_band_pitch + self.pitch_bins_per_octave).clamp_(
+                    max=pitch_bins - band_width
                 )[:, :, None],
             )
             double_pitch_band_proba[
                 quantized_band_pitch
-                > pitch_channels - band_width - self.bins_per_octave
+                > pitch_bins - band_width - self.pitch_bins_per_octave
             ] = 0.0
             double_pitch_proba = (double_pitch_band_proba / (band_proba + 1e-6)).view(
                 batch_size, 1, length
             )
-        # Long[1, pitch_channels]
-        mask = torch.arange(pitch_channels, device=pitch.device)[None, :]
-        # bool[batch_size * length, pitch_channels]
+        # Long[1, pitch_bins]
+        mask = torch.arange(pitch_bins, device=pitch.device)[None, :]
+        # bool[batch_size * length, pitch_bins]
         mask = (quantized_band_pitch <= mask) & (
             mask < quantized_band_pitch + band_width
         )
@@ -1086,24 +1498,6 @@ def generate_noise(
     noise = noise[:, delay : -hop_length + delay]
     excitation = excitation[:, delay : -hop_length + delay]
     return noise, excitation  # [batch_size, length * hop_length]
-
-
-class GradientEqualizerFunction(torch.autograd.Function):
-    """ノルムが小さいほど勾配が大きくなってしまうのを補正する"""
-
-    @staticmethod
-    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
-        # x: [batch_size, 1, length]
-        rms = x.square().mean(dim=2, keepdim=True).sqrt_()
-        ctx.save_for_backward(rms)
-        return x
-
-    @staticmethod
-    def backward(ctx, dx: torch.Tensor) -> torch.Tensor:
-        # dx: [batch_size, 1, length]
-        (rms,) = ctx.saved_tensors
-        dx = dx * (math.sqrt(2.0) * rms + 0.1)
-        return dx
 
 
 D4C_PREVENT_ZERO_DIVISION = True  # False にすると本家の処理
@@ -1493,6 +1887,7 @@ class Vocoder(nn.Module):
     def __init__(
         self,
         channels: int,
+        speaker_embedding_channels: int = 128,
         hop_length: int = 240,
         n_pre_blocks: int = 4,
         out_sample_rate: float = 24000.0,
@@ -1504,17 +1899,20 @@ class Vocoder(nn.Module):
         self.prenet = ConvNeXtStack(
             in_channels=channels,
             channels=channels,
-            intermediate_channels=channels * 3,
+            intermediate_channels=channels * 2,
             n_blocks=n_pre_blocks,
             delay=2,  # 20ms 遅延
             embed_kernel_size=7,
             kernel_size=33,
             enable_scaling=True,
+            use_mha=True,
+            cross_attention=True,
+            kv_channels=speaker_embedding_channels,
         )
         self.ir_generator = ConvNeXtStack(
             in_channels=channels,
             channels=channels,
-            intermediate_channels=channels * 3,
+            intermediate_channels=channels * 2,
             n_blocks=2,
             delay=0,
             embed_kernel_size=3,
@@ -1528,7 +1926,7 @@ class Vocoder(nn.Module):
         self.aperiodicity_generator = ConvNeXtStack(
             in_channels=channels,
             channels=channels,
-            intermediate_channels=channels * 3,
+            intermediate_channels=channels * 2,
             n_blocks=1,
             delay=0,
             embed_kernel_size=3,
@@ -1541,7 +1939,7 @@ class Vocoder(nn.Module):
         self.post_filter_generator = ConvNeXtStack(
             in_channels=channels,
             channels=channels,
-            intermediate_channels=channels * 3,
+            intermediate_channels=channels * 2,
             n_blocks=1,
             delay=0,
             embed_kernel_size=3,
@@ -1553,13 +1951,14 @@ class Vocoder(nn.Module):
         self.register_buffer("post_filter_scale", torch.tensor(0.01))
 
     def forward(
-        self, x: torch.Tensor, pitch: torch.Tensor
+        self, x: torch.Tensor, pitch: torch.Tensor, speaker_embedding: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         # x: [batch_size, channels, length]
         # pitch: [batch_size, length]
+        # speaker_embedding: [batch_size, speaker_embedding_length, speaker_embedding_channels]
         batch_size, _, length = x.size()
 
-        x = self.prenet(x)
+        x = self.prenet(x, speaker_embedding)
         ir = self.ir_generator(x)
         ir = F.silu(ir, inplace=True)
         # [batch_size, 512, length]
@@ -1642,8 +2041,6 @@ class Vocoder(nn.Module):
 
         # [batch_size, 1, length * hop_length]
         y_g_hat = (periodic_signal + aperiodic_signal)[:, None, :]
-
-        y_g_hat = GradientEqualizerFunction.apply(y_g_hat)
 
         return y_g_hat, {
             "periodic_signal": periodic_signal.detach(),
@@ -1761,20 +2158,36 @@ class ConverterNetwork(nn.Module):
         phone_extractor: PhoneExtractor,
         pitch_estimator: PitchEstimator,
         n_speakers: int,
+        pitch_bins: int,
         hidden_channels: int,
+        vq_topk: int = 4,
+        training_time_vq: Literal["none", "self", "random"] = "none",
+        phone_noise_ratio: int = 0.5,
+        floor_noise_level: float = 1e-3,
     ):
         super().__init__()
         self.frozen_modules = {
             "phone_extractor": phone_extractor.eval().requires_grad_(False),
             "pitch_estimator": pitch_estimator.eval().requires_grad_(False),
         }
+        self.pitch_bins = pitch_bins
+        self.phone_noise_ratio = phone_noise_ratio
+        self.floor_noise_level = floor_noise_level
         self.out_sample_rate = out_sample_rate = 24000
-        self.embed_phone = nn.Conv1d(256, hidden_channels, 1)
+        phone_channels = 128
+        self.vq = VectorQuantizer(
+            n_speakers=n_speakers,
+            codebook_size=512,
+            channels=phone_channels,
+            topk=vq_topk,
+            training_time_vq=training_time_vq,
+        )
+        self.embed_phone = nn.Conv1d(phone_channels, hidden_channels, 1)
         self.embed_phone.weight.data.normal_(0.0, math.sqrt(2.0 / (256 * 5)))
         self.embed_phone.bias.data.zero_()
-        self.embed_quantized_pitch = nn.Embedding(384, hidden_channels)
+        self.embed_quantized_pitch = nn.Embedding(pitch_bins, hidden_channels)
         phase = (
-            torch.arange(384, dtype=torch.float)[:, None]
+            torch.arange(pitch_bins, dtype=torch.float)[:, None]
             * (
                 torch.arange(0, hidden_channels, 2, dtype=torch.float)
                 * (-math.log(10000.0) / hidden_channels)
@@ -1791,8 +2204,22 @@ class ConverterNetwork(nn.Module):
         self.embed_speaker.weight.data.normal_(0.0, math.sqrt(2.0 / 5.0))
         self.embed_formant_shift = nn.Embedding(9, hidden_channels)
         self.embed_formant_shift.weight.data.normal_(0.0, math.sqrt(2.0 / 5.0))
+
+        self.key_value_speaker_embedding_length = 384
+        self.key_value_speaker_embedding_channels = 128
+        self.key_value_speaker_embedding = nn.Embedding(
+            n_speakers,
+            self.key_value_speaker_embedding_length
+            * self.key_value_speaker_embedding_channels,
+        )
+        self.key_value_speaker_embedding.weight.data[0].normal_()
+        self.key_value_speaker_embedding.weight.data[1:] = (
+            self.key_value_speaker_embedding.weight.data[0]
+        )
+
         self.vocoder = Vocoder(
             channels=hidden_channels,
+            speaker_embedding_channels=self.key_value_speaker_embedding_channels,
             hop_length=out_sample_rate // 100,
             n_pre_blocks=4,
             out_sample_rate=out_sample_rate,
@@ -1819,6 +2246,21 @@ class ConverterNetwork(nn.Module):
                     mel_scale="slaney",
                 )
             )
+
+    def initialize_vq(self, inputs: Sequence[Iterable[torch.Tensor]]):
+        collector_func = self.frozen_modules["phone_extractor"].units
+        target_layer = self.frozen_modules["phone_extractor"].head
+
+        self.vq.build_codebooks(
+            collector_func,
+            target_layer,
+            inputs,
+        )
+        self.vq.enable_hook(target_layer)
+
+    def enable_hook(self):
+        target_layer = self.frozen_modules["phone_extractor"].head
+        self.vq.enable_hook(target_layer)
 
     def _get_resampler(
         self, orig_freq, new_freq, device, cache={}
@@ -1849,27 +2291,53 @@ class ConverterNetwork(nn.Module):
         # slice_start_indices: [batch_size]
 
         batch_size, _, _ = x.size()
+        self.vq.set_target_speaker_ids(target_speaker_id)
 
         with torch.inference_mode():
             phone_extractor: PhoneExtractor = self.frozen_modules["phone_extractor"]
             pitch_estimator: PitchEstimator = self.frozen_modules["pitch_estimator"]
             # [batch_size, 1, wav_length] -> [batch_size, phone_channels, length]
             phone = phone_extractor.units(x).transpose(1, 2)
-            # [batch_size, 1, wav_length] -> [batch_size, pitch_channels, length], [batch_size, 1, length]
+
+            if self.training and self.phone_noise_ratio != 0.0:
+                phone *= (1.0 - self.phone_noise_ratio) / phone.square().mean(
+                    1, keepdim=True
+                ).sqrt_()
+                noise = torch.randn_like(phone)
+                noise *= (
+                    self.phone_noise_ratio
+                    / noise.square().mean(1, keepdim=True).sqrt_()
+                )
+                phone += noise
+            # F.rms_norm は PyTorch >= 2.4 が必要
+            phone *= (
+                1.0
+                / phone.square()
+                .mean(1, keepdim=True)
+                .add_(torch.finfo(torch.float).eps)
+                .sqrt_()
+            )
+
+            # [batch_size, 1, wav_length] -> [batch_size, pitch_bins, length], [batch_size, 1, length]
             pitch, energy = pitch_estimator(x)
             # augmentation
             if self.training:
-                # [batch_size, pitch_channels - 1]
+                # [batch_size, pitch_bins - 1]
                 weights = pitch.softmax(1)[:, 1:, :].mean(2)
                 # [batch_size]
                 mean_pitch = (
-                    weights * torch.arange(1, 384, device=weights.device)
+                    weights
+                    * torch.arange(
+                        1,
+                        self.embed_quantized_pitch.num_embeddings,
+                        device=weights.device,
+                    )
                 ).sum(1) / weights.sum(1)
                 mean_pitch = mean_pitch.round_().long()
                 target_pitch = torch.randint_like(mean_pitch, 64, 257)
                 shift = target_pitch - mean_pitch
                 shift_ratio = (
-                    2.0 ** (shift.float() / pitch_estimator.bins_per_octave)
+                    2.0 ** (shift.float() / pitch_estimator.pitch_bins_per_octave)
                 ).tolist()
                 shift = []
                 interval_length = 100  # 1s
@@ -1889,7 +2357,8 @@ class ConverterNetwork(nn.Module):
                     shift_ratio_i = shift_numer_i / shift_denom_i
                     shift_i = int(
                         round(
-                            math.log2(shift_ratio_i) * pitch_estimator.bins_per_octave
+                            math.log2(shift_ratio_i)
+                            * pitch_estimator.pitch_bins_per_octave
                         )
                     )
                     shift.append(shift_i)
@@ -1921,7 +2390,7 @@ class ConverterNetwork(nn.Module):
                 # [batch_size, 1, sum(wav_length) + batch_size * 16000]
                 concatenated_shifted_x = torch.cat(concatenated_shifted_x, dim=2)
                 assert concatenated_shifted_x.size(2) % (256 * 160) == 0
-                # [1, pitch_channels, length / shift_ratio], [1, 1, length / shift_ratio]
+                # [1, pitch_bins, length / shift_ratio], [1, 1, length / shift_ratio]
                 concatenated_pitch, concatenated_energy = pitch_estimator(
                     concatenated_shifted_x
                 )
@@ -1963,7 +2432,7 @@ class ConverterNetwork(nn.Module):
                     energy[i : i + 1, :, :length] = energy_i[:, :, :length]
                 torch.backends.cudnn.benchmark = True
 
-            # [batch_size, pitch_channels, length] -> Long[batch_size, length], [batch_size, 3, length]
+            # [batch_size, pitch_bins, length] -> Long[batch_size, length], [batch_size, 3, length]
             quantized_pitch, pitch_features = pitch_estimator.sample_pitch(
                 pitch, return_features=True
             )
@@ -1975,14 +2444,14 @@ class ConverterNetwork(nn.Module):
                         quantized_pitch
                         + (
                             pitch_shift_semitone[:, None]
-                            * (pitch_estimator.bins_per_octave / 12.0)
+                            * (pitch_estimator.pitch_bins_per_octave / 12.0)
                         )
                         .round_()
                         .long()
-                    ).clamp_(1, 383),
+                    ).clamp_(1, self.pitch_bins - 1),
                 )
             pitch = 55.0 * 2.0 ** (
-                quantized_pitch.float() / pitch_estimator.bins_per_octave
+                quantized_pitch.float() / pitch_estimator.pitch_bins_per_octave
             )
             # phone が 2.5ms 先読みしているのに対して、
             # energy は 12.5ms, pitch_features は 22.5ms 先読みしているので、
@@ -2017,8 +2486,15 @@ class ConverterNetwork(nn.Module):
             # [batch_size, hidden_channels, length] -> [batch_size, hidden_channels, segment_length]
             x = slice_segments(x, slice_start_indices, slice_segment_length)
         x = F.silu(x, inplace=True)
+
+        speaker_embedding = self.key_value_speaker_embedding(target_speaker_id).view(
+            batch_size,
+            self.key_value_speaker_embedding_length,
+            self.key_value_speaker_embedding_channels,
+        )
+
         # [batch_size, hidden_channels, segment_length] -> [batch_size, 1, segment_length * 240]
-        y_g_hat, stats = self.vocoder(x, pitch)
+        y_g_hat, stats = self.vocoder(x, pitch, speaker_embedding)
         stats["pitch"] = pitch
         if return_stats:
             return y_g_hat, stats
@@ -2026,7 +2502,7 @@ class ConverterNetwork(nn.Module):
             return y_g_hat
 
     def _normalize_melsp(self, x):
-        return x.clamp(min=1e-10).log_().mul_(0.5)
+        return x.clamp(min=1e-10).log_()
 
     def forward_and_compute_loss(
         self,
@@ -2037,7 +2513,15 @@ class ConverterNetwork(nn.Module):
         slice_segment_length: int,
         y_all: torch.Tensor,
         enable_loss_ap: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        dict[str, float],
+    ]:
         # noisy_wavs_16k: [batch_size, 1, wav_length]
         # target_speaker_id: Long[batch_size]
         # formant_shift_semitone: [batch_size]
@@ -2047,6 +2531,8 @@ class ConverterNetwork(nn.Module):
 
         stats = {}
         loss_mel = 0.0
+        loss_loudness = 0.0
+        loudness_win_lengths = [512, 1024, 2048, 4096]
 
         # [batch_size, 1, wav_length] -> [batch_size, 1, wav_length * 240]
         y_hat_all, intermediates = self(
@@ -2055,6 +2541,7 @@ class ConverterNetwork(nn.Module):
             formant_shift_semitone,
             return_stats=True,
         )
+        y_hat_all = y_hat_all.detach().where(y_all == 0.0, y_hat_all)
 
         with torch.amp.autocast("cuda", enabled=False):
             periodic_signal = intermediates["periodic_signal"].float()
@@ -2063,8 +2550,24 @@ class ConverterNetwork(nn.Module):
             periodic_signal = periodic_signal[:, : noise_excitation.size(1)]
             aperiodic_signal = aperiodic_signal[:, : noise_excitation.size(1)]
             y_hat_all = y_hat_all.float()
+            floor_noise = torch.randn_like(y_all) * self.floor_noise_level
+            y_all = y_all + floor_noise
+            y_hat_all += floor_noise
             y_hat_all_truncated = y_hat_all.squeeze(1)[:, : periodic_signal.size(1)]
             y_all_truncated = y_all.squeeze(1)[:, : periodic_signal.size(1)]
+
+            y_loudness = compute_loudness(
+                y_all_truncated, self.out_sample_rate, loudness_win_lengths
+            )
+            y_hat_loudness = compute_loudness(
+                y_hat_all_truncated, self.out_sample_rate, loudness_win_lengths
+            )
+            for win_length, y_loudness_i, y_hat_loudness_i in zip(
+                loudness_win_lengths, y_loudness, y_hat_loudness
+            ):
+                loss_loudness_i = F.mse_loss(y_hat_loudness_i, y_loudness_i)
+                loss_loudness += loss_loudness_i * math.sqrt(win_length)
+                stats[f"loss_loudness_{win_length}"] = loss_loudness_i.item()
 
             for melspectrogram in self.melspectrograms:
                 melsp_periodic_signal = melspectrogram(periodic_signal)
@@ -2105,6 +2608,7 @@ class ConverterNetwork(nn.Module):
                 t = (
                     torch.arange(intermediates["pitch"].size(1), device=y_all.device)
                     * 0.01
+                    + 0.005
                 )
                 y_coarse_aperiodicity, y_rms = d4c(
                     y_all.squeeze(1),
@@ -2126,7 +2630,7 @@ class ConverterNetwork(nn.Module):
                 loss_ap = F.mse_loss(
                     y_hat_coarse_aperiodicity, y_coarse_aperiodicity, reduction="none"
                 )
-                loss_ap *= (rms / (rms + 1e-3))[:, :, None]
+                loss_ap *= (rms / (rms + 1e-3) * (rms > 1e-5))[:, :, None]
                 loss_ap = loss_ap.mean()
             else:
                 loss_ap = torch.tensor(0.0)
@@ -2137,7 +2641,7 @@ class ConverterNetwork(nn.Module):
         )
         # [batch_size, 1, wav_length] -> [batch_size, 1, slice_segment_length * 240]
         y = slice_segments(y_all, slice_start_indices * 240, slice_segment_length * 240)
-        return y, y_hat, y_hat_all, loss_mel, loss_ap, stats
+        return y, y_hat, y_hat_all, loss_loudness, loss_mel, loss_ap, stats
 
     def merge_weights(self):
         self.vocoder.merge_weights()
@@ -2154,6 +2658,29 @@ class ConverterNetwork(nn.Module):
         dump_layer(self.embed_quantized_pitch, f)
         dump_layer(self.embed_pitch_features, f)
         dump_layer(self.vocoder, f)
+
+    def dump_speaker_embeddings(self, f: Union[BinaryIO, str, bytes, os.PathLike]):
+        if isinstance(f, (str, bytes, os.PathLike)):
+            with open(f, "wb") as f:
+                self.dump_speaker_embeddings(f)
+            return
+        if not hasattr(f, "write"):
+            raise TypeError
+
+        dump_params(self.vq.codebooks, f)
+        dump_layer(self.embed_speaker, f)
+        dump_layer(self.embed_formant_shift, f)
+        dump_layer(self.key_value_speaker_embedding, f)
+
+    def dump_embedding_setter(self, f: Union[BinaryIO, str, bytes, os.PathLike]):
+        if isinstance(f, (str, bytes, os.PathLike)):
+            with open(f, "wb") as f:
+                self.dump_embedding_setter(f)
+            return
+        if not hasattr(f, "write"):
+            raise TypeError
+
+        self.vocoder.prenet.dump_kv(f)
 
 
 # Discriminator
@@ -2288,8 +2815,8 @@ class DiscriminatorP(nn.Module):
             t = t + n_pad
         x = x.view(b, c, t // self.period, self.period)
 
-        for l in self.convs:
-            x = l(x)
+        for conv in self.convs:
+            x = conv(x)
             x = F.silu(x, inplace=True)
             fmap.append(x)
         if self.san:
@@ -2336,8 +2863,8 @@ class DiscriminatorR(nn.Module):
         fmap = []
 
         x = self._spectrogram(x).unsqueeze(1)
-        for l in self.convs:
-            x = l(x)
+        for conv in self.convs:
+            x = conv(x)
             x = F.silu(x, inplace=True)
             fmap.append(x)
         if self.san:
@@ -2457,10 +2984,11 @@ class MultiPeriodDiscriminator(nn.Module):
             # adversarial loss
             adv_loss = 0.0
             for dg, name in zip(y_d_gs, self.discriminator_names):
-                dg = dg.float()
                 if self.san:
-                    g_loss = F.softplus(1.0 - dg).square().mean()
+                    dg_fun = dg[0].float()
+                    g_loss = F.softplus(1.0 - dg_fun).square().mean()
                 else:
+                    dg = dg.float()
                     g_loss = (1.0 - dg).square().mean()
                 stats[f"{name}_gg_loss"] = g_loss.item()
                 adv_loss += g_loss
@@ -2678,6 +3206,82 @@ def convolve(signal: torch.Tensor, ir: torch.Tensor) -> torch.Tensor:
     return res[..., : signal.size(-1)]
 
 
+def random_formant_shift(
+    wav: torch.Tensor,
+    sample_rate: int,
+    formant_shift_semitone_min: float = -3.0,
+    formant_shift_semitone_max: float = 3.0,
+) -> torch.Tensor:
+    assert wav.ndim == 2
+    assert wav.size(0) == 1
+
+    device = wav.device
+
+    hop_length = 256
+
+    # [wav_length]
+    wav_np = wav.ravel().double().cpu().numpy()
+    f0, t = pyworld.dio(
+        wav_np,
+        sample_rate,
+        f0_floor=55,
+        f0_ceil=1400,
+        frame_period=hop_length * 1000 / sample_rate,
+    )
+    f0 = pyworld.stonemask(wav_np, f0, t, sample_rate)
+    world_sp = pyworld.cheaptrick(wav_np, f0, t, sample_rate)
+    world_sp = (
+        torch.from_numpy(world_sp).float().to(device).sqrt_()[None]
+    )  # [1, length, n_fft // 2 + 1]
+
+    n_fft = win_length = (world_sp.size(2) - 1) * 2
+
+    window = torch.hann_window(win_length, device=device)
+
+    # [1, n_fft // 2 + 1, length]
+    stft_sp = torch.stft(
+        wav,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        window=window,
+        return_complex=True,
+    )
+    assert world_sp.size(1) == stft_sp.size(2), (world_sp.size(), stft_sp.size())
+    assert world_sp.size(2) == stft_sp.size(1), (world_sp.size(), stft_sp.size())
+
+    shift_semitones = (
+        torch.rand(()).item()
+        * (formant_shift_semitone_max - formant_shift_semitone_min)
+        + formant_shift_semitone_min
+    )
+    shift_ratio = 2.0 ** (shift_semitones / 12.0)
+    shifted_world_sp = F.interpolate(
+        world_sp, scale_factor=shift_ratio, mode="linear", align_corners=True
+    )
+
+    if shifted_world_sp.size(2) > n_fft // 2 + 1:
+        shifted_world_sp = shifted_world_sp[:, :, : n_fft // 2 + 1]
+    elif shifted_world_sp.size(2) < n_fft // 2 + 1:
+        shifted_world_sp = F.pad(
+            shifted_world_sp, (0, n_fft // 2 + 1 - shifted_world_sp.size(2))
+        )
+
+    ratio = ((shifted_world_sp + 1e-5) / (world_sp + 1e-5)).clamp(0.1, 10.0)
+    stft_sp *= ratio.transpose(-2, -1)  # [1, n_fft // 2 + 1, length]
+
+    out = torch.istft(
+        stft_sp,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        window=window,
+        length=wav.size(-1),
+    )
+
+    return out
+
+
 def random_filter(audio: torch.Tensor) -> torch.Tensor:
     assert audio.ndim == 2
     ab = torch.rand(audio.size(0), 6) * 0.75 - 0.375
@@ -2720,7 +3324,7 @@ def get_noise(
 
 
 def get_butterworth_lpf(
-    cutoff_freq: int, sample_rate: int, cache={}
+    cutoff_freq: float, sample_rate: int, cache={}
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if (cutoff_freq, sample_rate) not in cache:
         q = math.sqrt(0.5)
@@ -2731,8 +3335,9 @@ def get_butterworth_lpf(
         b0 = b1 * 0.5
         a1 = -2.0 * cos_omega / (1.0 + alpha)
         a2 = (1.0 - alpha) / (1.0 + alpha)
-        cache[(cutoff_freq, sample_rate)] = torch.tensor([b0, b1, b0]), torch.tensor(
-            [1.0, a1, a2]
+        cache[(cutoff_freq, sample_rate)] = (
+            torch.tensor([b0, b1, b0]),
+            torch.tensor([1.0, a1, a2]),
         )
     return cache[(cutoff_freq, sample_rate)]
 
@@ -2742,14 +3347,25 @@ def augment_audio(
     sample_rate: int,
     noise_files: list[Union[str, bytes, os.PathLike]],
     ir_files: list[Union[str, bytes, os.PathLike]],
+    snr_candidates: list[float] = [20.0, 25.0, 30.0, 35.0, 40.0, 45.0],
+    formant_shift_probability: float = 0.5,
+    formant_shift_semitone_min: float = -3.0,
+    formant_shift_semitone_max: float = 3.0,
+    reverb_probability: float = 0.5,
+    lpf_probability: float = 0.2,
+    lpf_cutoff_freq_candidates: list[float] = [2000.0, 3000.0, 4000.0, 6000.0],
 ) -> torch.Tensor:
     # [1, wav_length]
     assert clean.size(0) == 1
     n_samples = clean.size(1)
 
-    snr_candidates = [-20, -25, -30, -35, -40, -45]
-
     original_clean_rms = clean.square().mean().sqrt_()
+
+    # clean をフォルマントシフトする
+    if torch.rand(()) < formant_shift_probability:
+        clean = random_formant_shift(
+            clean, sample_rate, formant_shift_semitone_min, formant_shift_semitone_max
+        )
 
     # noise を取得して clean と concat する
     noise = get_noise(n_samples, sample_rate, noise_files)
@@ -2759,7 +3375,7 @@ def augment_audio(
     signals = random_filter(signals)
 
     # clean, noise にリバーブをかける
-    if torch.rand(()) < 0.5:
+    if torch.rand(()) < reverb_probability:
         ir_file = ir_files[torch.randint(0, len(ir_files), ())]
         ir, sr = torchaudio.load(ir_file, backend="soundfile")
         assert ir.size() == (2, sr), ir.size()
@@ -2767,12 +3383,11 @@ def augment_audio(
         signals = convolve(signals, ir)
 
     # clean, noise に同じ LPF をかける
-    if torch.rand(()) < 0.2:
+    if torch.rand(()) < lpf_probability:
         if signals.abs().max() > 0.8:
             signals /= signals.abs().max() * 1.25
-        cutoff_freq_candidates = [2000, 3000, 4000, 6000]
-        cutoff_freq = cutoff_freq_candidates[
-            torch.randint(0, len(cutoff_freq_candidates), ())
+        cutoff_freq = lpf_cutoff_freq_candidates[
+            torch.randint(0, len(lpf_cutoff_freq_candidates), ())
         ]
         b, a = get_butterworth_lpf(cutoff_freq, sample_rate)
         signals = torchaudio.functional.lfilter(signals, a, b, clamp=False)
@@ -2782,13 +3397,17 @@ def augment_audio(
     clean_rms = clean.square().mean().sqrt_()
     clean *= original_clean_rms / clean_rms
 
-    # clean, noise の音量をピークを重視して取る
-    clean_level = clean.square().square_().mean().sqrt_().sqrt_()
-    noise_level = noise.square().square_().mean().sqrt_().sqrt_()
-    # SNR
-    snr = snr_candidates[torch.randint(0, len(snr_candidates), ())]
-    # noisy を生成
-    noisy = clean + noise * (10.0 ** (snr / 20.0) * clean_level / (noise_level + 1e-5))
+    if len(snr_candidates) >= 1:
+        # clean, noise の音量をピークを重視して取る
+        clean_level = clean.square().square_().mean().sqrt_().sqrt_()
+        noise_level = noise.square().square_().mean().sqrt_().sqrt_()
+        # SNR
+        snr = snr_candidates[torch.randint(0, len(snr_candidates), ())]
+        # noisy を生成
+        noisy = clean + noise * (
+            0.1 ** (snr / 20.0) * clean_level / (noise_level + 1e-5)
+        )
+
     return noisy
 
 
@@ -2802,6 +3421,18 @@ class WavDataset(torch.utils.data.Dataset):
         segment_length: int = 100,  # 1s
         noise_files: Optional[list[Union[str, bytes, os.PathLike]]] = None,
         ir_files: Optional[list[Union[str, bytes, os.PathLike]]] = None,
+        augmentation_snr_candidates: list[float] = [20.0, 25.0, 30.0, 35.0, 40.0, 45.0],
+        augmentation_formant_shift_probability: float = 0.5,
+        augmentation_formant_shift_semitone_min: float = -3.0,
+        augmentation_formant_shift_semitone_max: float = 3.0,
+        augmentation_reverb_probability: float = 0.5,
+        augmentation_lpf_probability: float = 0.2,
+        augmentation_lpf_cutoff_freq_candidates: list[float] = [
+            2000.0,
+            3000.0,
+            4000.0,
+            6000.0,
+        ],
     ):
         self.audio_files = audio_files
         self.in_sample_rate = in_sample_rate
@@ -2810,6 +3441,21 @@ class WavDataset(torch.utils.data.Dataset):
         self.segment_length = segment_length
         self.noise_files = noise_files
         self.ir_files = ir_files
+        self.augmentation_snr_candidates = augmentation_snr_candidates
+        self.augmentation_formant_shift_probability = (
+            augmentation_formant_shift_probability
+        )
+        self.augmentation_formant_shift_semitone_min = (
+            augmentation_formant_shift_semitone_min
+        )
+        self.augmentation_formant_shift_semitone_max = (
+            augmentation_formant_shift_semitone_max
+        )
+        self.augmentation_reverb_probability = augmentation_reverb_probability
+        self.augmentation_lpf_probability = augmentation_lpf_probability
+        self.augmentation_lpf_cutoff_freq_candidates = (
+            augmentation_lpf_cutoff_freq_candidates
+        )
 
         if (noise_files is None) is not (ir_files is None):
             raise ValueError("noise_files and ir_files must be both None or not None")
@@ -2851,7 +3497,17 @@ class WavDataset(torch.utils.data.Dataset):
                 clean_wav
             )
             noisy_wav_16k = augment_audio(
-                clean_wav_16k, self.in_sample_rate, self.noise_files, self.ir_files
+                clean_wav_16k,
+                self.in_sample_rate,
+                self.noise_files,
+                self.ir_files,
+                self.augmentation_snr_candidates,
+                self.augmentation_formant_shift_probability,
+                self.augmentation_formant_shift_semitone_min,
+                self.augmentation_formant_shift_semitone_max,
+                self.augmentation_reverb_probability,
+                self.augmentation_lpf_probability,
+                self.augmentation_lpf_cutoff_freq_candidates,
             )
 
         clean_wav = clean_wav.squeeze_(0)
@@ -2937,6 +3593,44 @@ AUDIO_FILE_SUFFIXES = {
 }
 
 
+def get_compressed_optimizer_state_dict(
+    optimizer: torch.optim.Optimizer,
+) -> dict:
+    state_dict = {}
+    for k0, v0 in optimizer.state_dict().items():
+        if k0 != "state":
+            state_dict[k0] = v0
+            continue
+        state_dict[k0] = {}
+        for k1, v1 in v0.items():
+            state_dict[k0][k1] = {}
+            for k2, v2 in v1.items():
+                if isinstance(v2, torch.Tensor):
+                    state_dict[k0][k1][k2] = v2.bfloat16()
+                    assert state_dict[k0][k1][k2].isfinite().all()
+                else:
+                    state_dict[k0][k1][k2] = v2
+    return state_dict
+
+
+def get_decompressed_optimizer_state_dict(compressed_state_dict: dict) -> dict:
+    state_dict = {}
+    for k0, v0 in compressed_state_dict.items():
+        if k0 != "state":
+            state_dict[k0] = v0
+            continue
+        state_dict[k0] = {}
+        for k1, v1 in v0.items():
+            state_dict[k0][k1] = {}
+            for k2, v2 in v1.items():
+                if isinstance(v2, torch.Tensor):
+                    state_dict[k0][k1][k2] = v2.float()
+                    assert state_dict[k0][k1][k2].isfinite().all()
+                else:
+                    state_dict[k0][k1][k2] = v2
+    return state_dict
+
+
 def prepare_training():
     # 各種準備をする
     # 副作用として、出力ディレクトリと TensorBoard のログファイルなどが生成される
@@ -2961,18 +3655,18 @@ def prepare_training():
     if not in_wav_dataset_dir.is_dir():
         raise ValueError(f"{in_wav_dataset_dir} is not found.")
     if resume:
-        latest_checkpoint_file = out_dir / "checkpoint_latest.pt"
+        latest_checkpoint_file = out_dir / "checkpoint_latest.pt.gz"
         if not latest_checkpoint_file.is_file():
             raise ValueError(f"{latest_checkpoint_file} is not found.")
     else:
         if out_dir.is_dir():
-            if (out_dir / "checkpoint_latest.pt").is_file():
+            if (out_dir / "checkpoint_latest.pt.gz").is_file():
                 raise ValueError(
-                    f"{out_dir / 'checkpoint_latest.pt'} already exists. "
+                    f"{out_dir / 'checkpoint_latest.pt.gz'} already exists. "
                     "Please specify a different output directory, or use --resume option."
                 )
             for file in out_dir.iterdir():
-                if file.suffix == ".pt":
+                if file.suffix == ".pt.gz":
                     raise ValueError(
                         f"{out_dir} already contains model files. "
                         "Please specify a different output directory."
@@ -3084,6 +3778,13 @@ def prepare_training():
         segment_length=h.segment_length,
         noise_files=noise_files,
         ir_files=ir_files,
+        augmentation_snr_candidates=h.augmentation_snr_candidates,
+        augmentation_formant_shift_probability=h.augmentation_formant_shift_probability,
+        augmentation_formant_shift_semitone_min=h.augmentation_formant_shift_semitone_min,
+        augmentation_formant_shift_semitone_max=h.augmentation_formant_shift_semitone_max,
+        augmentation_reverb_probability=h.augmentation_reverb_probability,
+        augmentation_lpf_probability=h.augmentation_lpf_probability,
+        augmentation_lpf_cutoff_freq_candidates=h.augmentation_lpf_cutoff_freq_candidates,
     )
     training_loader = torch.utils.data.DataLoader(
         training_dataset,
@@ -3112,7 +3813,9 @@ def prepare_training():
     print("Computing pitch shifts for test files...")
     test_pitch_shifts = []
     source_f0s = []
-    for i, (file, target_ids) in enumerate(tqdm(test_filelist)):
+    for i, (file, target_ids) in enumerate(
+        tqdm(test_filelist, desc="Computing pitch shifts")
+    ):
         source_f0 = compute_mean_f0([file], method="harvest")
         source_f0s.append(source_f0)
         if math.isnan(source_f0):
@@ -3136,7 +3839,9 @@ def prepare_training():
         repo_root() / h.phone_extractor_file, map_location="cpu", weights_only=True
     )
     print(
-        phone_extractor.load_state_dict(phone_extractor_checkpoint["phone_extractor"])
+        phone_extractor.load_state_dict(
+            phone_extractor_checkpoint["phone_extractor"], strict=False
+        )
     )
     del phone_extractor_checkpoint
 
@@ -3153,7 +3858,12 @@ def prepare_training():
         phone_extractor,
         pitch_estimator,
         n_speakers,
+        h.pitch_bins,
         h.hidden_channels,
+        h.vq_topk,
+        h.training_time_vq,
+        h.phone_noise_ratio,
+        h.floor_noise_level,
     ).to(device)
     net_d = MultiPeriodDiscriminator(san=h.san).to(device)
 
@@ -3173,6 +3883,7 @@ def prepare_training():
     grad_scaler = torch.amp.GradScaler("cuda", enabled=h.use_amp)
     grad_balancer = GradBalancer(
         weights={
+            "loss_loudness": h.grad_weight_loudness,
             "loss_mel": h.grad_weight_mel,
             "loss_adv": h.grad_weight_adv,
             "loss_fm": h.grad_weight_fm,
@@ -3187,72 +3898,76 @@ def prepare_training():
     # チェックポイント読み出し
 
     initial_iteration = 0
-    if resume:
+    if resume:  # 学習再開
         checkpoint_file = latest_checkpoint_file
-    elif h.pretrained_file is not None:
+    elif h.pretrained_file is not None:  # ファインチューニング
         checkpoint_file = repo_root() / h.pretrained_file
-    else:
+    else:  # 事前学習
         checkpoint_file = None
+
     if checkpoint_file is not None:
-        checkpoint = torch.load(checkpoint_file, map_location="cpu", weights_only=True)
+        with gzip.open(checkpoint_file, "rb") as f:
+            checkpoint = torch.load(f, map_location="cpu", weights_only=True)
         if not resume and not skip_training:  # ファインチューニング
-            checkpoint_n_speakers = len(checkpoint["net_g"]["embed_speaker.weight"])
-            initial_speaker_embedding = checkpoint["net_g"][
-                "embed_speaker.weight"
-            ].mean(0, keepdim=True)
-            if True:
-                checkpoint["net_g"]["embed_speaker.weight"] = initial_speaker_embedding[
-                    [0] * n_speakers
-                ]
-            else:  # 話者追加用
-                assert n_speakers > checkpoint_n_speakers
-                print(
-                    f"embed_speaker.weight was padded: {checkpoint_n_speakers} -> {n_speakers}"
-                )
-                checkpoint["net_g"]["embed_speaker.weight"] = F.pad(
-                    checkpoint["net_g"]["embed_speaker.weight"],
-                    (0, 0, 0, n_speakers - checkpoint_n_speakers),
-                )
-                checkpoint["net_g"]["embed_speaker.weight"][
-                    checkpoint_n_speakers:
-                ] = initial_speaker_embedding
+            initial_speaker_embedding = checkpoint["net_g"]["embed_speaker.weight"][:1]
+            initial_speaker_embedding_for_cross_attention = checkpoint["net_g"][
+                "key_value_speaker_embedding.weight"
+            ][:1]
+            checkpoint["net_g"]["embed_speaker.weight"] = initial_speaker_embedding[
+                [0] * n_speakers
+            ]
+            checkpoint["net_g"]["key_value_speaker_embedding.weight"] = (
+                initial_speaker_embedding_for_cross_attention[[0] * n_speakers]
+            )
+            checkpoint["net_g"]["vq.codebooks"] = checkpoint["net_g"]["vq.codebooks"][
+                [0] * n_speakers
+            ]
         print(net_g.load_state_dict(checkpoint["net_g"], strict=False))
         print(net_d.load_state_dict(checkpoint["net_d"], strict=False))
         if resume or skip_training:
-            optim_g.load_state_dict(checkpoint["optim_g"])
-            optim_d.load_state_dict(checkpoint["optim_d"])
+            optim_g.load_state_dict(
+                get_decompressed_optimizer_state_dict(checkpoint["optim_g"])
+            )
+            optim_d.load_state_dict(
+                get_decompressed_optimizer_state_dict(checkpoint["optim_d"])
+            )
             initial_iteration = checkpoint["iteration"]
         grad_balancer.load_state_dict(checkpoint["grad_balancer"])
         grad_scaler.load_state_dict(checkpoint["grad_scaler"])
 
+    def wav_iterator(files):
+        for file in files:
+            wav, sr = torchaudio.load(file, backend="soundfile")
+            wav = wav.to(device)
+            if sr != h.in_sample_rate:
+                wav = get_resampler(sr, h.in_sample_rate, device)(wav)
+            yield wav[:, None, :]
+
+    if resume:
+        net_g.enable_hook()
+    else:
+        net_g.initialize_vq([wav_iterator(files) for files in speaker_audio_files])
+
     # スケジューラ
 
-    def get_cosine_annealing_warmup_scheduler(
+    def get_exponential_warmup_scheduler(
         optimizer: torch.optim.Optimizer,
         warmup_epochs: int,
-        total_epochs: int,
-        min_learning_rate: float,
+        decay: float,
     ) -> torch.optim.lr_scheduler.LambdaLR:
-        lr_ratio = min_learning_rate / optimizer.param_groups[0]["lr"]
-        m = 0.5 * (1.0 - lr_ratio)
-        a = 0.5 * (1.0 + lr_ratio)
-
         def lr_lambda(current_epoch: int) -> float:
             if current_epoch < warmup_epochs:
                 return current_epoch / warmup_epochs
-            elif current_epoch < total_epochs:
-                rate = (current_epoch - warmup_epochs) / (total_epochs - warmup_epochs)
-                return math.cos(rate * math.pi) * m + a
             else:
-                return min_learning_rate
+                return decay ** (current_epoch - warmup_epochs)
 
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    scheduler_g = get_cosine_annealing_warmup_scheduler(
-        optim_g, h.warmup_steps, h.n_steps, h.min_learning_rate_g
+    scheduler_g = get_exponential_warmup_scheduler(
+        optim_g, h.warmup_steps, h.learning_rate_decay
     )
-    scheduler_d = get_cosine_annealing_warmup_scheduler(
-        optim_d, h.warmup_steps, h.n_steps, h.min_learning_rate_d
+    scheduler_d = get_exponential_warmup_scheduler(
+        optim_d, h.warmup_steps, h.learning_rate_decay
     )
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -3274,6 +3989,9 @@ def prepare_training():
         writer = None
     else:
         writer = SummaryWriter(out_dir)
+        if not h.record_metrics:
+            writer.add_scalar = lambda *args, **kwargs: None
+            writer.add_histogram = lambda *args, **kwargs: None
         writer.add_text(
             "log",
             f"start training w/ {torch.cuda.get_device_name(device) if torch.cuda.is_available() else 'cpu'}.",
@@ -3367,12 +4085,11 @@ if __name__ == "__main__" and writer is not None:
         if h.profile
         else nullcontext()
     ) as profiler:
-
-        for iteration in tqdm(range(initial_iteration, h.n_steps)):
+        for iteration in tqdm(range(initial_iteration, h.n_steps), desc="Training"):
             # === 1. データ前処理 ===
             try:
                 batch = next(data_iter)
-            except:
+            except (NameError, StopIteration):
                 data_iter = iter(training_loader)
                 batch = next(data_iter)
             (
@@ -3388,20 +4105,27 @@ if __name__ == "__main__" and writer is not None:
                 # === 2.1 Generator の順伝播 ===
                 if h.compile_convnext:
                     ConvNeXtStack.forward = compiled_convnextstack_forward
-                y, y_hat, y_hat_for_backward, loss_mel, loss_ap, generator_stats = (
-                    net_g.forward_and_compute_loss(
-                        noisy_wavs_16k[:, None, :],
-                        speaker_ids,
-                        formant_shift_semitone,
-                        slice_start_indices=slice_starts,
-                        slice_segment_length=h.segment_length,
-                        y_all=clean_wavs[:, None, :],
-                        enable_loss_ap=h.grad_weight_ap != 0.0,
-                    )
+                (
+                    y,
+                    y_hat,
+                    y_hat_for_backward,
+                    loss_loudness,
+                    loss_mel,
+                    loss_ap,
+                    generator_stats,
+                ) = net_g.forward_and_compute_loss(
+                    noisy_wavs_16k[:, None, :],
+                    speaker_ids,
+                    formant_shift_semitone,
+                    slice_start_indices=slice_starts,
+                    slice_segment_length=h.segment_length,
+                    y_all=clean_wavs[:, None, :],
+                    enable_loss_ap=h.grad_weight_ap != 0.0,
                 )
                 if h.compile_convnext:
                     ConvNeXtStack.forward = raw_convnextstack_forward
                 assert y_hat.isfinite().all()
+                assert loss_loudness.isfinite().all()
                 assert loss_mel.isfinite().all()
                 assert loss_ap.isfinite().all()
 
@@ -3432,6 +4156,7 @@ if __name__ == "__main__" and writer is not None:
                 assert param.grad is None
             gradient_balancer_stats = grad_balancer.backward(
                 {
+                    "loss_loudness": loss_loudness,
                     "loss_mel": loss_mel,
                     "loss_adv": loss_adv,
                     "loss_fm": loss_fm,
@@ -3441,6 +4166,7 @@ if __name__ == "__main__" and writer is not None:
                 grad_scaler,
                 skip_update_ema=iteration > 10 and iteration % 5 != 0,
             )
+            loss_loudness = loss_loudness.item()
             loss_mel = loss_mel.item()
             loss_adv = loss_adv.item()
             loss_fm = loss_fm.item()
@@ -3461,6 +4187,7 @@ if __name__ == "__main__" and writer is not None:
             grad_scaler.update()
 
             # === 3. ログ ===
+            dict_scalars["loss_g/loss_loudness"].append(loss_loudness)
             dict_scalars["loss_g/loss_mel"].append(loss_mel)
             if h.grad_weight_ap:
                 dict_scalars["loss_g/loss_ap"].append(loss_ap)
@@ -3569,11 +4296,8 @@ if __name__ == "__main__" and writer is not None:
                     )
 
             # === 4. 検証 ===
-            if (iteration + 1) % (
-                50000 if h.n_steps > 200000 else 2000
-            ) == 0 or iteration + 1 in {
+            if (iteration + 1) % h.evaluation_interval == 0 or iteration + 1 in {
                 1,
-                30000,
                 h.n_steps,
             }:
                 torch.backends.cudnn.benchmark = False
@@ -3670,36 +4394,36 @@ if __name__ == "__main__" and writer is not None:
                 torch.cuda.empty_cache()
 
             # === 5. 保存 ===
-            if (iteration + 1) % (
-                50000 if h.n_steps > 200000 else 2000
-            ) == 0 or iteration + 1 in {
+            if (iteration + 1) % h.save_interval == 0 or iteration + 1 in {
                 1,
-                30000,
                 h.n_steps,
             }:
                 # チェックポイント
                 name = f"{in_wav_dataset_dir.name}_{iteration + 1:08d}"
-                checkpoint_file_save = out_dir / f"checkpoint_{name}.pt"
+                checkpoint_file_save = out_dir / f"checkpoint_{name}.pt.gz"
                 if checkpoint_file_save.exists():
                     checkpoint_file_save = checkpoint_file_save.with_name(
                         f"{checkpoint_file_save.name}_{hash(None):x}"
                     )
-                torch.save(
-                    {
-                        "iteration": iteration + 1,
-                        "net_g": net_g.state_dict(),
-                        "phone_extractor": phone_extractor.state_dict(),
-                        "pitch_estimator": pitch_estimator.state_dict(),
-                        "net_d": net_d.state_dict(),
-                        "optim_g": optim_g.state_dict(),
-                        "optim_d": optim_d.state_dict(),
-                        "grad_balancer": grad_balancer.state_dict(),
-                        "grad_scaler": grad_scaler.state_dict(),
-                        "h": dict(h),
-                    },
-                    checkpoint_file_save,
-                )
-                shutil.copy(checkpoint_file_save, out_dir / "checkpoint_latest.pt")
+                with gzip.open(checkpoint_file_save, "wb") as f:
+                    torch.save(
+                        {
+                            "iteration": iteration + 1,
+                            "net_g": net_g.state_dict(),
+                            "phone_extractor": phone_extractor.state_dict(),
+                            "pitch_estimator": pitch_estimator.state_dict(),
+                            "net_d": {
+                                k: v.half() for k, v in net_d.state_dict().items()
+                            },
+                            "optim_g": get_compressed_optimizer_state_dict(optim_g),
+                            "optim_d": get_compressed_optimizer_state_dict(optim_d),
+                            "grad_balancer": grad_balancer.state_dict(),
+                            "grad_scaler": grad_scaler.state_dict(),
+                            "h": dict(h),
+                        },
+                        f,
+                    )
+                shutil.copy(checkpoint_file_save, out_dir / "checkpoint_latest.pt.gz")
 
                 # 推論用
                 paraphernalia_dir = out_dir / f"paraphernalia_{name}"
@@ -3713,27 +4437,35 @@ if __name__ == "__main__" and writer is not None:
                 phone_extractor_fp16.remove_weight_norm()
                 phone_extractor_fp16.merge_weights()
                 phone_extractor_fp16.half()
-                phone_extractor_fp16.dump(paraphernalia_dir / f"phone_extractor.bin")
+                phone_extractor_fp16.dump(paraphernalia_dir / "phone_extractor.bin")
                 del phone_extractor_fp16
                 pitch_estimator_fp16 = PitchEstimator()
                 pitch_estimator_fp16.load_state_dict(pitch_estimator.state_dict())
                 pitch_estimator_fp16.merge_weights()
                 pitch_estimator_fp16.half()
-                pitch_estimator_fp16.dump(paraphernalia_dir / f"pitch_estimator.bin")
+                pitch_estimator_fp16.dump(paraphernalia_dir / "pitch_estimator.bin")
                 del pitch_estimator_fp16
                 net_g_fp16 = ConverterNetwork(
-                    nn.Module(), nn.Module(), len(speakers), h.hidden_channels
+                    nn.Module(),
+                    nn.Module(),
+                    len(speakers),
+                    h.pitch_bins,
+                    h.hidden_channels,
+                    h.vq_topk,
+                    h.training_time_vq,
+                    h.phone_noise_ratio,
+                    h.floor_noise_level,
                 )
                 net_g_fp16.load_state_dict(net_g.state_dict())
                 net_g_fp16.merge_weights()
                 net_g_fp16.half()
-                net_g_fp16.dump(paraphernalia_dir / f"waveform_generator.bin")
-                with open(paraphernalia_dir / f"speaker_embeddings.bin", "wb") as f:
-                    dump_layer(net_g_fp16.embed_speaker, f)
-                with open(
-                    paraphernalia_dir / f"formant_shift_embeddings.bin", "wb"
-                ) as f:
-                    dump_layer(net_g_fp16.embed_formant_shift, f)
+                net_g_fp16.dump(paraphernalia_dir / "waveform_generator.bin")
+                net_g_fp16.dump_speaker_embeddings(
+                    paraphernalia_dir / "speaker_embeddings.bin"
+                )
+                net_g_fp16.dump_embedding_setter(
+                    paraphernalia_dir / "embedding_setter.bin"
+                )
                 del net_g_fp16
                 shutil.copy(
                     repo_root() / "assets/images/noimage.png", paraphernalia_dir
