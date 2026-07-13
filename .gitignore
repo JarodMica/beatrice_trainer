@@ -1,2 +1,3 @@
-build/
-*.egg-info/
+*.lock
+work/*
+__pycache__
