@@ -1,3 +1,4 @@
-*.lock
+.venv/
+local/
 work/*
-__pycache__
+__pycache__/
