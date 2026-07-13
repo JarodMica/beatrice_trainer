@@ -49,10 +49,15 @@ def is_notebook() -> bool:
 
 
 def repo_root() -> Path:
-    d = Path.cwd() / "dummy" if is_notebook() else Path(__file__)
+    if not is_notebook():
+        package_root = Path(__file__).resolve().parents[1]
+        if (package_root / "pyproject.toml").is_file():
+            return package_root
+
+    d = Path.cwd() / "dummy"
     assert d.is_absolute(), d
     for d in d.parents:
-        if (d / ".git").is_dir():
+        if (d / ".git").exists():
             return d
     raise RuntimeError("Repository root is not found.")
 
