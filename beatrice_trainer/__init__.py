@@ -1,1 +1,1 @@
-from .__main__ import *
+"""Beatrice model trainer package."""

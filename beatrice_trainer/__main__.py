@@ -3786,16 +3786,17 @@ def prepare_training():
         augmentation_lpf_probability=h.augmentation_lpf_probability,
         augmentation_lpf_cutoff_freq_candidates=h.augmentation_lpf_cutoff_freq_candidates,
     )
+    num_workers = min(h.num_workers, os.cpu_count() or h.num_workers)
     training_loader = torch.utils.data.DataLoader(
         training_dataset,
-        num_workers=min(h.num_workers, os.cpu_count()),
+        num_workers=num_workers,
         collate_fn=training_dataset.collate,
         shuffle=True,
         sampler=None,
         batch_size=h.batch_size,
         pin_memory=True,
         drop_last=True,
-        persistent_workers=True,
+        persistent_workers=num_workers > 0,
     )
 
     print("Computing mean F0s of target speakers...", end="")
